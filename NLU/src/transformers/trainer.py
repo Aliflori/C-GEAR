@@ -1557,8 +1557,8 @@ class Trainer:
                 if regu_loss is None:
                     regu_loss = compute_regu(para_cov_A)
                 else:
-                    regu_loss += compute_regu(para_cov_A)
-                regu_loss += compute_regu(para_cov_B)
+                    regu_loss = regu_loss + compute_regu(para_cov_A)
+                regu_loss = regu_loss + compute_regu(para_cov_B)
                 num_param += 2
         return regu_loss/num_param
 
