@@ -1,10 +1,11 @@
 # coding=utf-8
-"""Lightweight fixed-cardinality genetic allocation for EvoIncreLoRA."""
+"""Interaction-aware evolutionary rank allocation for EvoIncreLoRA."""
 
 import math
 import random
 
 
+_FITNESS_TOLERANCE = 1e-12
 _LOCAL_SEARCH_IMPROVEMENT_TOLERANCE = 1e-12
 
 
@@ -40,7 +41,6 @@ def _deduplicated_scores(scores):
         except TypeError:
             raise TypeError("Candidate module identifiers must be hashable.")
         if is_duplicate:
-            # Keep the first occurrence so malformed duplicate input is deterministic.
             continue
         seen.add(identifier)
         items.append((identifier, _finite_float(score)))
@@ -89,7 +89,11 @@ def _history_vector(value):
     return tuple(history)
 
 
-def _centered_temporal_features(identifiers, module_features, max_window=20, epsilon=1e-12):
+def _centered_temporal_features(
+    identifiers, module_features, max_window=20, epsilon=1e-12
+):
+    """Create scale-invariant temporal trajectories for pair interactions."""
+
     history_map = _value_map(module_features, _history_vector)
     histories = [history_map.get(identifier, ()) for identifier in identifiers]
     if len(histories) < 2 or any(len(history) < 2 for history in histories):
@@ -184,6 +188,8 @@ def _structural_similarity(left, right):
 
 
 def _cosine_similarity(left, right):
+    """Return signed cosine similarity so anti-correlation remains observable."""
+
     if not left or not right:
         return 0.0
     pairs = list(zip(left, right))
@@ -194,9 +200,7 @@ def _cosine_similarity(left, right):
     right_norm = math.sqrt(sum(b * b for _, b in pairs))
     if left_norm == 0.0 or right_norm == 0.0:
         return 0.0
-    similarity = dot / (left_norm * right_norm)
-    # Redundancy penalizes positive similarity, not opposite feature directions.
-    return min(1.0, max(0.0, similarity))
+    return min(1.0, max(-1.0, dot / (left_norm * right_norm)))
 
 
 def _validate_configuration(
@@ -204,21 +208,28 @@ def _validate_configuration(
     generations,
     mutation_rate,
     crossover_rate,
+    interaction_weight,
     redundancy_weight,
     cost_weight,
+    diversity_weight,
 ):
     if population_size <= 0:
         raise ValueError("ga_population must be positive.")
     if generations < 0:
         raise ValueError("ga_generations must be nonnegative.")
-    if not math.isfinite(mutation_rate) or mutation_rate < 0.0 or mutation_rate > 1.0:
+    if not math.isfinite(mutation_rate) or not 0.0 <= mutation_rate <= 1.0:
         raise ValueError("ga_mutation_rate must be between 0 and 1.")
-    if not math.isfinite(crossover_rate) or crossover_rate < 0.0 or crossover_rate > 1.0:
+    if not math.isfinite(crossover_rate) or not 0.0 <= crossover_rate <= 1.0:
         raise ValueError("ga_crossover_rate must be between 0 and 1.")
-    if not math.isfinite(redundancy_weight) or redundancy_weight < 0.0:
-        raise ValueError("ga_redundancy_weight must be nonnegative.")
-    if not math.isfinite(cost_weight) or cost_weight < 0.0:
-        raise ValueError("ga_cost_weight must be nonnegative.")
+    nonnegative_weights = (
+        ("ga_interaction_weight", interaction_weight),
+        ("ga_redundancy_weight", redundancy_weight),
+        ("ga_cost_weight", cost_weight),
+        ("ga_diversity_weight", diversity_weight),
+    )
+    for name, value in nonnegative_weights:
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError("%s must be nonnegative." % name)
 
 
 def select_modules_genetic(
@@ -229,31 +240,39 @@ def select_modules_genetic(
     generations=4,
     mutation_rate=0.10,
     crossover_rate=0.80,
+    interaction_weight=0.20,
     redundancy_weight=0.20,
     cost_weight=0.30,
+    diversity_weight=0.10,
     seed=0,
     module_features=None,
+    local_search=False,
 ):
-    """Select a deterministic, fixed-size module set with a lightweight GA.
+    """Select a fixed-cardinality module set with interaction-aware evolution.
 
-    ``scores`` may be a mapping or an ordered iterable of ``(identifier, score)``
-    pairs. Invalid and non-finite numerical inputs are replaced with zero. The
-    first occurrence of a duplicate identifier is retained.
+    The default result is the best chromosome discovered by the evolutionary
+    search itself. One-swap local refinement is disabled by default and exists
+    only as an explicit ablation through ``local_search=True``.
     """
 
     population_size = int(population_size)
     generations = int(generations)
     mutation_rate = float(mutation_rate)
     crossover_rate = float(crossover_rate)
+    interaction_weight = float(interaction_weight)
     redundancy_weight = float(redundancy_weight)
     cost_weight = float(cost_weight)
+    diversity_weight = float(diversity_weight)
+    local_search = bool(local_search)
     _validate_configuration(
         population_size,
         generations,
         mutation_rate,
         crossover_rate,
+        interaction_weight,
         redundancy_weight,
         cost_weight,
+        diversity_weight,
     )
 
     score_items = _deduplicated_scores(scores)
@@ -261,19 +280,25 @@ def select_modules_genetic(
     raw_scores = [score for _, score in score_items]
     candidate_count = len(identifiers)
     selection_size = min(max(int(top_h), 0), candidate_count)
+    normalized_scores = _normalized_scores(raw_scores)
 
     cost_map = _value_map(costs, lambda value: max(0.0, _finite_float(value)))
     candidate_costs = [cost_map.get(identifier, 0.0) for identifier in identifiers]
-    normalized_scores = _normalized_scores(raw_scores)
+    sorted_costs = sorted(candidate_costs)
+    minimum_feasible_cost = sum(sorted_costs[:selection_size])
+    maximum_feasible_cost = (
+        sum(sorted_costs[-selection_size:]) if selection_size else 0.0
+    )
+    feasible_cost_width = maximum_feasible_cost - minimum_feasible_cost
 
     temporal_features = _centered_temporal_features(identifiers, module_features)
     features_available = len(temporal_features) == candidate_count and candidate_count >= 2
     structural_signatures = [_structural_signature(identifier) for identifier in identifiers]
 
     if features_available:
-        redundancy_feature_mode = "temporal_centered"
+        interaction_feature_mode = "temporal_complementarity"
 
-        def pair_similarity(left_index, right_index):
+        def pair_relation(left_index, right_index):
             return _cosine_similarity(
                 temporal_features[left_index], temporal_features[right_index]
             )
@@ -285,35 +310,42 @@ def select_modules_genetic(
             for right in range(left + 1, candidate_count)
         ]
         if any(similarity > 0.0 for similarity in structural_similarities):
-            redundancy_feature_mode = "structural_fallback"
+            interaction_feature_mode = "structural_redundancy_only"
 
-            def pair_similarity(left_index, right_index):
+            def pair_relation(left_index, right_index):
                 return _structural_similarity(
                     structural_signatures[left_index], structural_signatures[right_index]
                 )
 
         else:
-            redundancy_feature_mode = "unavailable"
+            interaction_feature_mode = "unavailable"
 
-            def pair_similarity(left_index, right_index):
+            def pair_relation(left_index, right_index):
                 return 0.0
 
-    candidate_pair_similarities = [
-        pair_similarity(left, right)
+    def pair_redundancy(left_index, right_index):
+        return max(0.0, pair_relation(left_index, right_index))
+
+    def pair_interaction_gain(left_index, right_index):
+        if not features_available:
+            return 0.0
+        complementarity = max(0.0, -pair_relation(left_index, right_index))
+        importance_gate = math.sqrt(
+            max(0.0, normalized_scores[left_index])
+            * max(0.0, normalized_scores[right_index])
+        )
+        return complementarity * importance_gate
+
+    candidate_pair_relations = [
+        pair_relation(left, right)
         for left in range(candidate_count)
         for right in range(left + 1, candidate_count)
     ]
-    candidate_pair_similarity_min = (
-        min(candidate_pair_similarities) if candidate_pair_similarities else 0.0
-    )
-    candidate_pair_similarity_mean = (
-        sum(candidate_pair_similarities) / len(candidate_pair_similarities)
-        if candidate_pair_similarities
-        else 0.0
-    )
-    candidate_pair_similarity_max = (
-        max(candidate_pair_similarities) if candidate_pair_similarities else 0.0
-    )
+    candidate_pair_interactions = [
+        pair_interaction_gain(left, right)
+        for left in range(candidate_count)
+        for right in range(left + 1, candidate_count)
+    ]
 
     greedy_indices = sorted(
         range(candidate_count), key=lambda index: (-raw_scores[index], index)
@@ -345,38 +377,71 @@ def select_modules_genetic(
             else 0.0
         )
         selected_cost = sum(candidate_costs[index] for index in chromosome)
-        cost_difference = abs(selected_cost - greedy_cost)
-        normalized_cost_penalty = cost_difference / max(greedy_cost, 1.0)
+        normalized_cost_penalty = (
+            (selected_cost - minimum_feasible_cost) / feasible_cost_width
+            if feasible_cost_width > 0.0
+            else 0.0
+        )
+        normalized_cost_penalty = min(1.0, max(0.0, normalized_cost_penalty))
 
-        similarities = []
+        redundancies = []
+        interactions = []
         for left_position, left_index in enumerate(chromosome):
             for right_index in chromosome[left_position + 1 :]:
-                similarities.append(pair_similarity(left_index, right_index))
+                redundancies.append(pair_redundancy(left_index, right_index))
+                interactions.append(pair_interaction_gain(left_index, right_index))
         redundancy_score = (
-            sum(similarities) / len(similarities) if similarities else 0.0
+            sum(redundancies) / len(redundancies) if redundancies else 0.0
         )
+        interaction_gain = (
+            sum(interactions) / len(interactions) if interactions else 0.0
+        )
+        weighted_interaction_gain = interaction_weight * interaction_gain
         weighted_redundancy_penalty = redundancy_weight * redundancy_score
         weighted_cost_penalty = cost_weight * normalized_cost_penalty
         total_fitness = (
             importance_reward
+            + weighted_interaction_gain
             - weighted_redundancy_penalty
             - weighted_cost_penalty
         )
         return {
             "total_fitness": total_fitness,
             "importance_reward": importance_reward,
+            "interaction_gain": interaction_gain,
+            "weighted_interaction_gain": weighted_interaction_gain,
             "redundancy_score": redundancy_score,
             "weighted_redundancy_penalty": weighted_redundancy_penalty,
-            "cost_difference": cost_difference,
+            "cost_difference": abs(selected_cost - greedy_cost),
             "normalized_cost_penalty": normalized_cost_penalty,
             "weighted_cost_penalty": weighted_cost_penalty,
             "selected_parameter_cost": selected_cost,
             "greedy_parameter_cost": greedy_cost,
+            "minimum_feasible_parameter_cost": minimum_feasible_cost,
+            "maximum_feasible_parameter_cost": maximum_feasible_cost,
             "redundancy_features_available": features_available,
-            "redundancy_feature_mode": redundancy_feature_mode,
-            "candidate_pair_similarity_min": candidate_pair_similarity_min,
-            "candidate_pair_similarity_mean": candidate_pair_similarity_mean,
-            "candidate_pair_similarity_max": candidate_pair_similarity_max,
+            "redundancy_feature_mode": interaction_feature_mode,
+            "interaction_features_available": features_available,
+            "interaction_feature_mode": interaction_feature_mode,
+            "candidate_pair_similarity_min": (
+                min(candidate_pair_relations) if candidate_pair_relations else 0.0
+            ),
+            "candidate_pair_similarity_mean": (
+                sum(candidate_pair_relations) / len(candidate_pair_relations)
+                if candidate_pair_relations
+                else 0.0
+            ),
+            "candidate_pair_similarity_max": (
+                max(candidate_pair_relations) if candidate_pair_relations else 0.0
+            ),
+            "candidate_pair_interaction_mean": (
+                sum(candidate_pair_interactions) / len(candidate_pair_interactions)
+                if candidate_pair_interactions
+                else 0.0
+            ),
+            "candidate_pair_interaction_max": (
+                max(candidate_pair_interactions) if candidate_pair_interactions else 0.0
+            ),
         }
 
     greedy_components = evaluate_subset(greedy_chromosome)
@@ -387,80 +452,111 @@ def select_modules_genetic(
 
     def evaluate_ga_chromosome(chromosome):
         nonlocal best_non_greedy_chromosome, best_non_greedy_components
+        chromosome = tuple(sorted(chromosome))
         if not is_valid_chromosome(chromosome):
             raise ValueError("GA produced an invalid chromosome.")
-
         if chromosome not in fitness_cache:
             fitness_cache[chromosome] = evaluate_subset(chromosome)
-        subset_components = fitness_cache[chromosome]
+        components = fitness_cache[chromosome]
         chromosome_set = frozenset(chromosome)
         evaluated_ga_chromosome_sets.add(chromosome_set)
-
         if chromosome_set != greedy_index_set and (
             best_non_greedy_chromosome is None
-            or subset_components["total_fitness"]
-            > best_non_greedy_components["total_fitness"]
+            or components["total_fitness"]
+            > best_non_greedy_components["total_fitness"] + _FITNESS_TOLERANCE
             or (
-                subset_components["total_fitness"]
-                == best_non_greedy_components["total_fitness"]
+                abs(
+                    components["total_fitness"]
+                    - best_non_greedy_components["total_fitness"]
+                )
+                <= _FITNESS_TOLERANCE
                 and chromosome_identifier_key(chromosome)
                 < chromosome_identifier_key(best_non_greedy_chromosome)
             )
         ):
             best_non_greedy_chromosome = chromosome
-            best_non_greedy_components = subset_components
-        return subset_components
+            best_non_greedy_components = components
+        return components
+
+    def fitness(chromosome):
+        return evaluate_ga_chromosome(chromosome)["total_fitness"]
+
+    def chromosome_distance(left, right):
+        if selection_size == 0:
+            return 0.0
+        return 1.0 - len(set(left).intersection(right)) / selection_size
+
+    def population_diversity(population):
+        if len(population) < 2:
+            return 0.0
+        distances = [
+            chromosome_distance(left, right)
+            for left_position, left in enumerate(population)
+            for right in population[left_position + 1 :]
+        ]
+        return sum(distances) / len(distances) if distances else 0.0
+
+    def is_better(left, right):
+        left_fitness = fitness(left)
+        right_fitness = fitness(right)
+        if left_fitness > right_fitness + _FITNESS_TOLERANCE:
+            return True
+        if right_fitness > left_fitness + _FITNESS_TOLERANCE:
+            return False
+        return chromosome_identifier_key(left) < chromosome_identifier_key(right)
+
+    def best_chromosome(population):
+        best = population[0]
+        for chromosome in population[1:]:
+            if is_better(chromosome, best):
+                best = chromosome
+        return best
 
     one_swap_cache = {}
 
     def best_single_swap_neighbor(start_chromosome):
         if selection_size <= 0 or selection_size >= candidate_count:
             return None, None, None, None
-
         start_chromosome = tuple(sorted(start_chromosome))
-        if not is_valid_chromosome(start_chromosome):
-            raise ValueError("Local search received an invalid chromosome.")
         if start_chromosome in one_swap_cache:
             return one_swap_cache[start_chromosome]
 
         selected_set = set(start_chromosome)
-        best_chromosome = None
+        best_neighbor = None
         best_components = None
         best_removed_index = None
         best_added_index = None
-        removed_indices = sorted(start_chromosome, key=identifier_index_key)
-        added_indices = sorted(
-            (index for index in range(candidate_count) if index not in selected_set),
-            key=identifier_index_key,
-        )
-        for removed_index in removed_indices:
-            for added_index in added_indices:
+        for removed_index in sorted(start_chromosome, key=identifier_index_key):
+            for added_index in sorted(
+                (index for index in range(candidate_count) if index not in selected_set),
+                key=identifier_index_key,
+            ):
                 neighbor = tuple(
                     sorted(
                         selected_set.difference((removed_index,)).union((added_index,))
                     )
                 )
-                # Fixed cardinality is the allocator's feasibility/budget contract.
-                if not is_valid_chromosome(neighbor):
-                    continue
                 neighbor_components = evaluate_subset(neighbor)
                 if (
-                    best_chromosome is None
+                    best_neighbor is None
                     or neighbor_components["total_fitness"]
-                    > best_components["total_fitness"]
+                    > best_components["total_fitness"] + _FITNESS_TOLERANCE
                     or (
-                        neighbor_components["total_fitness"]
-                        == best_components["total_fitness"]
+                        abs(
+                            neighbor_components["total_fitness"]
+                            - best_components["total_fitness"]
+                        )
+                        <= _FITNESS_TOLERANCE
                         and chromosome_identifier_key(neighbor)
-                        < chromosome_identifier_key(best_chromosome)
+                        < chromosome_identifier_key(best_neighbor)
                     )
                 ):
-                    best_chromosome = neighbor
+                    best_neighbor = neighbor
                     best_components = neighbor_components
                     best_removed_index = removed_index
                     best_added_index = added_index
         result = (
-            best_chromosome,
+            best_neighbor,
             best_components,
             best_removed_index,
             best_added_index,
@@ -470,12 +566,9 @@ def select_modules_genetic(
 
     def refine_once(start_chromosome, start_source):
         before_components = evaluate_subset(start_chromosome)
-        (
-            neighbor,
-            neighbor_components,
-            removed_index,
-            added_index,
-        ) = best_single_swap_neighbor(start_chromosome)
+        neighbor, neighbor_components, removed_index, added_index = (
+            best_single_swap_neighbor(start_chromosome)
+        )
         improved = (
             neighbor_components is not None
             and neighbor_components["total_fitness"]
@@ -496,48 +589,111 @@ def select_modules_genetic(
             ),
         }
 
-    def diagnostic_components(prefix, subset_components):
-        if subset_components is None:
+    def diagnostic_components(prefix, components):
+        if components is None:
             return {
                 prefix + "fitness": None,
                 prefix + "importance_reward": None,
+                prefix + "interaction_gain": None,
                 prefix + "redundancy_score": None,
                 prefix + "normalized_cost_penalty": None,
             }
         return {
-            prefix + "fitness": subset_components["total_fitness"],
-            prefix + "importance_reward": subset_components["importance_reward"],
-            prefix + "redundancy_score": subset_components["redundancy_score"],
-            prefix + "normalized_cost_penalty": subset_components[
+            prefix + "fitness": components["total_fitness"],
+            prefix + "importance_reward": components["importance_reward"],
+            prefix + "interaction_gain": components["interaction_gain"],
+            prefix + "redundancy_score": components["redundancy_score"],
+            prefix + "normalized_cost_penalty": components[
                 "normalized_cost_penalty"
             ],
         }
 
-    def diagnostics(
-        chromosome,
-        initial_unique_count,
-        final_unique_count,
-        ga_pre_local_chromosome,
-        selection_metadata,
+    def finalize_selection(
+        ga_best_chromosome,
+        initial_population,
+        final_population,
+        initial_best_fitness,
+        diversity_history,
+        unique_history,
+        generation_best_history,
+        initialization_source_counts,
     ):
-        result = evaluate_subset(chromosome)
-        selected_set = set(chromosome)
+        ga_best_chromosome = tuple(sorted(ga_best_chromosome))
+        ga_best_components = evaluate_subset(ga_best_chromosome)
+        selected_chromosome = ga_best_chromosome
+        selection_metadata = {
+            "start_source": "ga",
+            "improved": False,
+            "removed_index": None,
+            "added_index": None,
+            "fitness_before": ga_best_components["total_fitness"],
+            "fitness_after": ga_best_components["total_fitness"],
+            "selected_source": "ga_only",
+        }
+        best_single_swap_chromosome = None
+        best_single_swap_components = None
+        best_single_swap_removed_index = None
+        best_single_swap_added_index = None
+
+        if local_search:
+            (
+                best_single_swap_chromosome,
+                best_single_swap_components,
+                best_single_swap_removed_index,
+                best_single_swap_added_index,
+            ) = best_single_swap_neighbor(greedy_chromosome)
+            greedy_refinement = refine_once(greedy_chromosome, "greedy")
+            ga_refinement = refine_once(ga_best_chromosome, "ga")
+            candidates = [(ga_best_chromosome, "ga", None)]
+            if greedy_refinement["improved"]:
+                candidates.append(
+                    (
+                        greedy_refinement["chromosome"],
+                        "greedy_local_refinement",
+                        greedy_refinement,
+                    )
+                )
+            if ga_refinement["improved"]:
+                candidates.append(
+                    (
+                        ga_refinement["chromosome"],
+                        "ga_local_refinement",
+                        ga_refinement,
+                    )
+                )
+            selected_chromosome, selected_source, selected_refinement = candidates[0]
+            for candidate_chromosome, candidate_source, candidate_refinement in candidates[1:]:
+                if is_better(candidate_chromosome, selected_chromosome):
+                    selected_chromosome = candidate_chromosome
+                    selected_source = candidate_source
+                    selected_refinement = candidate_refinement
+            if selected_refinement is None:
+                selected_components = evaluate_subset(selected_chromosome)
+                selection_metadata = {
+                    "start_source": selected_source,
+                    "improved": False,
+                    "removed_index": None,
+                    "added_index": None,
+                    "fitness_before": selected_components["total_fitness"],
+                    "fitness_after": selected_components["total_fitness"],
+                    "selected_source": selected_source,
+                }
+            else:
+                selection_metadata = dict(selected_refinement)
+                selection_metadata["selected_source"] = selected_source
+
+        selected_components = evaluate_subset(selected_chromosome)
+        selected_set = set(selected_chromosome)
         greedy_set = set(greedy_chromosome)
         union = selected_set.union(greedy_set)
-        (
-            best_single_swap_chromosome,
-            best_single_swap_components,
-            best_single_swap_removed_index,
-            best_single_swap_added_index,
-        ) = best_single_swap_neighbor(greedy_chromosome)
         greedy_fitness = greedy_components["total_fitness"]
-        ga_pre_local_fitness = evaluate_subset(ga_pre_local_chromosome)[
-            "total_fitness"
-        ]
-        result.update(
+        ga_best_fitness = ga_best_components["total_fitness"]
+        diagnostics = dict(selected_components)
+        diagnostics.update(
             {
                 "candidate_count": candidate_count,
                 "selection_size": selection_size,
+                "selected_modules": [identifiers[index] for index in selected_chromosome],
                 "selected_set_equals_greedy": selected_set == greedy_set,
                 "selected_greedy_jaccard": (
                     len(selected_set.intersection(greedy_set)) / len(union)
@@ -545,8 +701,43 @@ def select_modules_genetic(
                     else 1.0
                 ),
                 "selected_non_greedy_count": len(selected_set.difference(greedy_set)),
-                "unique_population_count_initial": initial_unique_count,
-                "unique_population_count_final": final_unique_count,
+                "ga_best_modules": [
+                    identifiers[index] for index in ga_best_chromosome
+                ],
+                "ga_best_fitness": ga_best_fitness,
+                "ga_best_fitness_minus_greedy": ga_best_fitness - greedy_fitness,
+                "ga_beats_greedy": (
+                    ga_best_fitness > greedy_fitness + _FITNESS_TOLERANCE
+                ),
+                "ga_best_equals_greedy": (
+                    frozenset(ga_best_chromosome) == greedy_index_set
+                ),
+                "ga_initial_best_fitness": initial_best_fitness,
+                "ga_improved_over_initial": (
+                    ga_best_fitness
+                    > initial_best_fitness + _FITNESS_TOLERANCE
+                ),
+                "ga_pre_local_fitness": ga_best_fitness,
+                "population_diversity": population_diversity(final_population),
+                "population_diversity_initial": population_diversity(
+                    initial_population
+                ),
+                "population_diversity_final": population_diversity(
+                    final_population
+                ),
+                "population_diversity_history": list(diversity_history),
+                "unique_population_count_initial": len(set(initial_population)),
+                "unique_population_count_final": len(set(final_population)),
+                "unique_population_count_history": list(unique_history),
+                "evaluated_unique_chromosome_count": len(
+                    evaluated_ga_chromosome_sets
+                ),
+                "generation_best_fitness_history": list(
+                    generation_best_history
+                ),
+                "initialization_source_counts": dict(
+                    initialization_source_counts
+                ),
                 "best_non_greedy_found": best_non_greedy_chromosome is not None,
                 "best_non_greedy_modules": (
                     [identifiers[index] for index in best_non_greedy_chromosome]
@@ -558,6 +749,28 @@ def select_modules_genetic(
                     if best_non_greedy_components is not None
                     else None
                 ),
+                "local_search_enabled": local_search,
+                "local_search_start_source": selection_metadata["start_source"],
+                "local_search_improved": selection_metadata["improved"],
+                "local_search_removed_module": (
+                    identifiers[selection_metadata["removed_index"]]
+                    if selection_metadata["removed_index"] is not None
+                    else None
+                ),
+                "local_search_added_module": (
+                    identifiers[selection_metadata["added_index"]]
+                    if selection_metadata["added_index"] is not None
+                    else None
+                ),
+                "local_search_fitness_before": selection_metadata[
+                    "fitness_before"
+                ],
+                "local_search_fitness_after": selection_metadata["fitness_after"],
+                "local_search_fitness_gain": (
+                    selection_metadata["fitness_after"]
+                    - selection_metadata["fitness_before"]
+                ),
+                "selected_source": selection_metadata["selected_source"],
                 "best_single_swap_modules": (
                     [identifiers[index] for index in best_single_swap_chromosome]
                     if best_single_swap_chromosome is not None
@@ -582,125 +795,40 @@ def select_modules_genetic(
                     frozenset(best_single_swap_chromosome)
                     in evaluated_ga_chromosome_sets
                     if best_single_swap_chromosome is not None
-                    else False
-                ),
-                "ga_pre_local_fitness": ga_pre_local_fitness,
-                "local_search_start_source": selection_metadata["start_source"],
-                "local_search_improved": selection_metadata["improved"],
-                "local_search_removed_module": (
-                    identifiers[selection_metadata["removed_index"]]
-                    if selection_metadata["removed_index"] is not None
                     else None
                 ),
-                "local_search_added_module": (
-                    identifiers[selection_metadata["added_index"]]
-                    if selection_metadata["added_index"] is not None
-                    else None
-                ),
-                "local_search_fitness_before": selection_metadata[
-                    "fitness_before"
-                ],
-                "local_search_fitness_after": selection_metadata["fitness_after"],
-                "local_search_fitness_gain": (
-                    selection_metadata["fitness_after"]
-                    - selection_metadata["fitness_before"]
-                ),
-                "selected_source": selection_metadata["selected_source"],
                 "selected_matches_diagnostic_best_single_swap": (
-                    frozenset(chromosome) == frozenset(best_single_swap_chromosome)
+                    frozenset(selected_chromosome)
+                    == frozenset(best_single_swap_chromosome)
                     if best_single_swap_chromosome is not None
                     else None
                 ),
             }
         )
-        result.update(diagnostic_components("greedy_", greedy_components))
-        result.update(
+        diagnostics.update(diagnostic_components("greedy_", greedy_components))
+        diagnostics.update(
             diagnostic_components("best_non_greedy_", best_non_greedy_components)
         )
-        result.update(
-            diagnostic_components("best_single_swap_", best_single_swap_components)
-        )
-        return result
-
-    def finalize_selection(ga_pre_local_chromosome, initial_unique_count, final_unique_count):
-        ga_pre_local_chromosome = tuple(sorted(ga_pre_local_chromosome))
-        ga_pre_local_is_greedy = (
-            frozenset(ga_pre_local_chromosome) == greedy_index_set
-        )
-        greedy_refinement = refine_once(greedy_chromosome, "greedy")
-        ga_refinement = (
-            greedy_refinement
-            if ga_pre_local_is_greedy
-            else refine_once(ga_pre_local_chromosome, "ga")
-        )
-
-        candidates = [(greedy_chromosome, "greedy", None)]
-        if not ga_pre_local_is_greedy:
-            candidates.append((ga_pre_local_chromosome, "ga", None))
-        if greedy_refinement["improved"]:
-            candidates.append(
-                (
-                    greedy_refinement["chromosome"],
-                    "greedy_local_refinement",
-                    greedy_refinement,
-                )
+        diagnostics.update(
+            diagnostic_components(
+                "best_single_swap_", best_single_swap_components
             )
-        if ga_refinement["improved"]:
-            candidates.append(
-                (
-                    ga_refinement["chromosome"],
-                    "ga_local_refinement",
-                    ga_refinement,
-                )
-            )
-
-        source_priority = {
-            "greedy": 0,
-            "ga": 1,
-            "greedy_local_refinement": 2,
-            "ga_local_refinement": 3,
-        }
-        selected_chromosome, selected_source, selected_refinement = min(
-            candidates,
-            key=lambda candidate: (
-                -evaluate_subset(candidate[0])["total_fitness"],
-                chromosome_identifier_key(candidate[0]),
-                source_priority[candidate[1]],
-            ),
         )
+        return diagnostics["selected_modules"], diagnostics
 
-        if selected_refinement is None:
-            selected_fitness = evaluate_subset(selected_chromosome)["total_fitness"]
-            selection_metadata = {
-                "start_source": selected_source,
-                "improved": False,
-                "removed_index": None,
-                "added_index": None,
-                "fitness_before": selected_fitness,
-                "fitness_after": selected_fitness,
-                "selected_source": selected_source,
-            }
-        else:
-            selection_metadata = dict(selected_refinement)
-            selection_metadata["selected_source"] = selected_source
-
-        selected_modules = [identifiers[index] for index in selected_chromosome]
-        final_diagnostics = diagnostics(
-            selected_chromosome,
-            initial_unique_count,
-            final_unique_count,
-            ga_pre_local_chromosome,
-            selection_metadata,
+    evaluate_ga_chromosome(greedy_chromosome)
+    if selection_size == 0 or selection_size == candidate_count:
+        singleton_population = [greedy_chromosome]
+        return finalize_selection(
+            greedy_chromosome,
+            singleton_population,
+            singleton_population,
+            greedy_components["total_fitness"],
+            [0.0],
+            [1],
+            [greedy_components["total_fitness"]],
+            {"greedy": 1, "greedy_neighbor": 0, "diversity_aware": 0, "random": 0},
         )
-        return selected_modules, final_diagnostics
-
-    if selection_size == 0:
-        evaluate_ga_chromosome(greedy_chromosome)
-        return finalize_selection(greedy_chromosome, 1, 1)
-
-    if selection_size == candidate_count:
-        evaluate_ga_chromosome(greedy_chromosome)
-        return finalize_selection(greedy_chromosome, 1, 1)
 
     rng = random.Random(seed)
 
@@ -718,86 +846,322 @@ def select_modules_genetic(
         repaired.extend(missing[: selection_size - len(repaired)])
         return tuple(sorted(repaired))
 
-    def crossover(left, right):
-        if rng.random() >= crossover_rate:
-            child = left if rng.random() < 0.5 else right
-        else:
-            shared = sorted(set(left).intersection(right))
-            remaining = sorted(set(left).union(right).difference(shared))
-            rng.shuffle(remaining)
-            child = repair(shared + remaining)
-        evaluate_ga_chromosome(child)
-        return child
+    minimum_candidate_cost = min(candidate_costs) if candidate_costs else 0.0
+    maximum_candidate_cost = max(candidate_costs) if candidate_costs else 0.0
+    candidate_cost_width = maximum_candidate_cost - minimum_candidate_cost
 
-    def mutate(chromosome):
-        if rng.random() >= mutation_rate or selection_size >= candidate_count:
-            evaluate_ga_chromosome(chromosome)
-            return chromosome
-        child = list(chromosome)
-        replace_position = rng.randrange(selection_size)
-        unselected = [
-            index for index in range(candidate_count) if index not in chromosome
-        ]
-        child[replace_position] = rng.choice(unselected)
-        mutated = repair(child)
-        evaluate_ga_chromosome(mutated)
-        return mutated
+    def marginal_utility(candidate, selected):
+        if candidate in selected:
+            return float("-inf")
+        interaction = (
+            sum(pair_interaction_gain(candidate, other) for other in selected)
+            / len(selected)
+            if selected
+            else 0.0
+        )
+        redundancy = (
+            sum(pair_redundancy(candidate, other) for other in selected)
+            / len(selected)
+            if selected
+            else 0.0
+        )
+        normalized_candidate_cost = (
+            (candidate_costs[candidate] - minimum_candidate_cost)
+            / candidate_cost_width
+            if candidate_cost_width > 0.0
+            else 0.0
+        )
+        return (
+            normalized_scores[candidate]
+            + interaction_weight * interaction
+            - redundancy_weight * redundancy
+            - cost_weight * normalized_candidate_cost / max(selection_size, 1)
+        )
 
-    def fitness(chromosome):
-        return evaluate_ga_chromosome(chromosome)["total_fitness"]
+    def rank_candidates(candidates, selected, frequency=None):
+        frequency = frequency or {}
+        return sorted(
+            candidates,
+            key=lambda candidate: (
+                -(
+                    marginal_utility(candidate, selected)
+                    + diversity_weight
+                    * (1.0 - frequency.get(candidate, 0.0))
+                ),
+                identifier_index_key(candidate),
+            ),
+        )
 
-    def ranked(population):
-        # Python's stable sort retains population order for equal fitness.
-        return sorted(population, key=lambda chromosome: -fitness(chromosome))
+    def restricted_choice(candidates, selected, frequency=None, exploration=0.15):
+        ordered = rank_candidates(candidates, selected, frequency=frequency)
+        if len(ordered) == 1 or rng.random() >= exploration:
+            return ordered[0]
+        restricted_size = min(3, len(ordered))
+        return ordered[rng.randrange(restricted_size)]
 
-    def select_parent(population):
-        left = population[rng.randrange(len(population))]
-        right = population[rng.randrange(len(population))]
-        if fitness(left) == fitness(right):
-            return left
-        return left if fitness(left) > fitness(right) else right
+    def random_neighbor(chromosome, swap_count):
+        selected = set(chromosome)
+        swap_count = min(swap_count, selection_size, candidate_count - selection_size)
+        removed = rng.sample(sorted(selected), swap_count)
+        available = [index for index in range(candidate_count) if index not in selected]
+        added = rng.sample(available, swap_count)
+        return tuple(sorted(selected.difference(removed).union(added)))
 
-    population = [greedy_chromosome]
-    evaluate_ga_chromosome(greedy_chromosome)
-    seen = {greedy_chromosome}
+    def construct_diversity_aware(existing_population):
+        frequency = {}
+        denominator = max(len(existing_population), 1)
+        for chromosome in existing_population:
+            for index in chromosome:
+                frequency[index] = frequency.get(index, 0) + 1
+        frequency = {
+            index: count / denominator for index, count in frequency.items()
+        }
+        selected = []
+        while len(selected) < selection_size:
+            candidates = [
+                index for index in range(candidate_count) if index not in selected
+            ]
+            selected.append(
+                restricted_choice(
+                    candidates,
+                    selected,
+                    frequency=frequency,
+                    exploration=0.35,
+                )
+            )
+        return tuple(sorted(selected))
+
+    population = []
+    population_seen = set()
+    initialization_source_counts = {
+        "greedy": 0,
+        "greedy_neighbor": 0,
+        "diversity_aware": 0,
+        "random": 0,
+    }
+
+    def add_initial(chromosome, source):
+        chromosome = repair(chromosome)
+        if chromosome in population_seen or len(population) >= population_size:
+            return False
+        population_seen.add(chromosome)
+        population.append(chromosome)
+        initialization_source_counts[source] += 1
+        evaluate_ga_chromosome(chromosome)
+        return True
+
+    add_initial(greedy_chromosome, "greedy")
+    non_greedy_slots = max(population_size - 1, 0)
+    neighbor_target = max(1, non_greedy_slots // 3) if non_greedy_slots else 0
+    diverse_target = max(1, non_greedy_slots // 3) if non_greedy_slots else 0
+
     attempts = 0
-    max_attempts = max(20, population_size * 10)
+    while initialization_source_counts["greedy_neighbor"] < neighbor_target and attempts < population_size * 20:
+        attempts += 1
+        swap_count = 1 + ((attempts - 1) % min(2, selection_size))
+        add_initial(
+            random_neighbor(greedy_chromosome, swap_count), "greedy_neighbor"
+        )
+
+    attempts = 0
+    while initialization_source_counts["diversity_aware"] < diverse_target and attempts < population_size * 20:
+        attempts += 1
+        add_initial(construct_diversity_aware(population), "diversity_aware")
+
+    attempts = 0
+    max_attempts = max(50, population_size * 30)
     while len(population) < population_size and attempts < max_attempts:
         attempts += 1
-        chromosome = tuple(sorted(rng.sample(range(candidate_count), selection_size)))
-        if chromosome not in seen:
-            seen.add(chromosome)
-            population.append(chromosome)
-            evaluate_ga_chromosome(chromosome)
+        add_initial(
+            tuple(sorted(rng.sample(range(candidate_count), selection_size))),
+            "random",
+        )
     while len(population) < population_size:
         chromosome = tuple(sorted(rng.sample(range(candidate_count), selection_size)))
         population.append(chromosome)
+        initialization_source_counts["random"] += 1
         evaluate_ga_chromosome(chromosome)
 
-    initial_unique_count = len(set(population))
-    best = ranked(population)[0]
-    for _ in range(generations):
-        ordered_population = ranked(population)
-        elite_count = min(2, max(1, len(ordered_population) // 4))
-        next_population = list(ordered_population[:elite_count])
-        next_seen = set(next_population)
-        duplicate_attempts = 0
-        max_duplicate_attempts = max(20, population_size * 10)
-        while len(next_population) < population_size:
-            left = select_parent(ordered_population)
-            right = select_parent(ordered_population)
-            child = mutate(crossover(left, right))
-            if child in next_seen and duplicate_attempts < max_duplicate_attempts:
-                duplicate_attempts += 1
-                continue
-            next_population.append(child)
-            next_seen.add(child)
-        population = next_population
-        generation_best = ranked(population)[0]
-        if fitness(generation_best) > fitness(best):
-            best = generation_best
+    initial_population = list(population)
+    initial_best = best_chromosome(population)
+    initial_best_fitness = fitness(initial_best)
+    archive_best = initial_best
+    diversity_history = [population_diversity(population)]
+    unique_history = [len(set(population))]
+    generation_best_history = [initial_best_fitness]
 
-    final_ordered_population = ranked(population)
-    if fitness(final_ordered_population[0]) > fitness(best):
-        best = final_ordered_population[0]
-    return finalize_selection(best, initial_unique_count, len(set(population)))
+    def population_novelty(chromosome, current_population):
+        others = [other for other in current_population if other != chromosome]
+        if not others:
+            return 0.0
+        return sum(chromosome_distance(chromosome, other) for other in others) / len(others)
+
+    def select_parent(current_population):
+        tournament_size = min(3, len(current_population))
+        contestants = rng.sample(current_population, tournament_size)
+        return min(
+            contestants,
+            key=lambda chromosome: (
+                -(
+                    fitness(chromosome)
+                    + diversity_weight
+                    * population_novelty(chromosome, current_population)
+                ),
+                chromosome_identifier_key(chromosome),
+            ),
+        )
+
+    def crossover(left, right):
+        if rng.random() >= crossover_rate:
+            return left if rng.random() < 0.5 else right
+        shared = set(left).intersection(right)
+        parental_union = sorted(set(left).union(right))
+        selected = []
+        while len(selected) < selection_size:
+            candidates = [index for index in parental_union if index not in selected]
+            if not candidates:
+                candidates = [
+                    index for index in range(candidate_count) if index not in selected
+                ]
+            ordered = sorted(
+                candidates,
+                key=lambda candidate: (
+                    -(
+                        marginal_utility(candidate, selected)
+                        + (diversity_weight * 0.5 if candidate in shared else 0.0)
+                    ),
+                    identifier_index_key(candidate),
+                ),
+            )
+            if len(ordered) > 1 and rng.random() < 0.15:
+                chosen = ordered[rng.randrange(min(3, len(ordered)))]
+            else:
+                chosen = ordered[0]
+            selected.append(chosen)
+        child = tuple(sorted(selected))
+        evaluate_ga_chromosome(child)
+        return child
+
+    def mutate(chromosome, effective_mutation_rate):
+        child = set(chromosome)
+        mutation_count = sum(
+            1 for _ in chromosome if rng.random() < effective_mutation_rate
+        )
+        if mutation_count == 0:
+            evaluate_ga_chromosome(chromosome)
+            return chromosome
+        mutation_count = min(
+            mutation_count, selection_size, candidate_count - selection_size
+        )
+        for _ in range(mutation_count):
+            selected = sorted(child)
+            removal_order = sorted(
+                selected,
+                key=lambda candidate: (
+                    marginal_utility(
+                        candidate, [other for other in selected if other != candidate]
+                    ),
+                    identifier_index_key(candidate),
+                ),
+            )
+            removed = (
+                removal_order[rng.randrange(min(2, len(removal_order)))]
+                if len(removal_order) > 1 and rng.random() < 0.20
+                else removal_order[0]
+            )
+            child.remove(removed)
+            candidates = [index for index in range(candidate_count) if index not in child]
+            added = restricted_choice(
+                candidates,
+                sorted(child),
+                exploration=0.20,
+            )
+            child.add(added)
+        mutated = tuple(sorted(child))
+        evaluate_ga_chromosome(mutated)
+        return mutated
+
+    def environmental_selection(candidate_population):
+        unique_candidates = list(dict.fromkeys(candidate_population))
+        if len(unique_candidates) <= population_size:
+            selected = list(unique_candidates)
+            while len(selected) < population_size:
+                selected.append(unique_candidates[len(selected) % len(unique_candidates)])
+            return selected
+
+        candidate_fitnesses = [fitness(chromosome) for chromosome in unique_candidates]
+        lowest_fitness = min(candidate_fitnesses)
+        highest_fitness = max(candidate_fitnesses)
+        fitness_width = highest_fitness - lowest_fitness
+
+        selected = [best_chromosome(unique_candidates)]
+        remaining = [
+            chromosome for chromosome in unique_candidates if chromosome not in selected
+        ]
+        while len(selected) < population_size and remaining:
+            chosen = min(
+                remaining,
+                key=lambda chromosome: (
+                    -(
+                        (
+                            (fitness(chromosome) - lowest_fitness) / fitness_width
+                            if fitness_width > 0.0
+                            else 0.0
+                        )
+                        + diversity_weight
+                        * min(
+                            chromosome_distance(chromosome, survivor)
+                            for survivor in selected
+                        )
+                    ),
+                    -fitness(chromosome),
+                    chromosome_identifier_key(chromosome),
+                ),
+            )
+            selected.append(chosen)
+            remaining.remove(chosen)
+        return selected
+
+    for _ in range(generations):
+        current_diversity = population_diversity(population)
+        diversity_deficit = max(0.0, 0.60 - current_diversity)
+        effective_mutation_rate = min(
+            0.50, mutation_rate * (1.0 + 2.0 * diversity_deficit)
+        )
+        offspring = []
+        offspring_seen = set()
+        attempts = 0
+        max_attempts = max(50, population_size * 20)
+        while len(offspring) < population_size and attempts < max_attempts:
+            attempts += 1
+            child = mutate(
+                crossover(select_parent(population), select_parent(population)),
+                effective_mutation_rate,
+            )
+            if child not in offspring_seen:
+                offspring_seen.add(child)
+                offspring.append(child)
+        while len(offspring) < population_size:
+            offspring.append(
+                tuple(sorted(rng.sample(range(candidate_count), selection_size)))
+            )
+            evaluate_ga_chromosome(offspring[-1])
+
+        population = environmental_selection(population + offspring)
+        generation_best = best_chromosome(population)
+        if is_better(generation_best, archive_best):
+            archive_best = generation_best
+        diversity_history.append(population_diversity(population))
+        unique_history.append(len(set(population)))
+        generation_best_history.append(fitness(generation_best))
+
+    return finalize_selection(
+        archive_best,
+        initial_population,
+        population,
+        initial_best_fitness,
+        diversity_history,
+        unique_history,
+        generation_best_history,
+        initialization_source_counts,
+    )

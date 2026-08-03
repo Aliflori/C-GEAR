@@ -316,6 +316,10 @@ class TrainingArguments(TrainingArguments):
         default=0.80,
         metadata={"help": "Set-aware crossover probability for the genetic allocator."},
     )
+    ga_interaction_weight: float = field(
+        default=0.20,
+        metadata={"help": "Weight of temporal module-complementarity gain."},
+    )
     ga_redundancy_weight: float = field(
         default=0.20,
         metadata={"help": "Weight of the pairwise redundancy penalty."},
@@ -323,6 +327,14 @@ class TrainingArguments(TrainingArguments):
     ga_cost_weight: float = field(
         default=0.30,
         metadata={"help": "Weight of the added-parameter cost penalty."},
+    )
+    ga_diversity_weight: float = field(
+        default=0.10,
+        metadata={"help": "Weight of population novelty during evolution."},
+    )
+    ga_local_search: bool = field(
+        default=False,
+        metadata={"help": "Enable one-swap local refinement for ablation only."},
     )
 
     def __post_init__(self):
@@ -337,10 +349,14 @@ class TrainingArguments(TrainingArguments):
             raise ValueError("ga_mutation_rate must be between 0 and 1.")
         if not math.isfinite(self.ga_crossover_rate) or not 0.0 <= self.ga_crossover_rate <= 1.0:
             raise ValueError("ga_crossover_rate must be between 0 and 1.")
+        if not math.isfinite(self.ga_interaction_weight) or self.ga_interaction_weight < 0.0:
+            raise ValueError("ga_interaction_weight must be nonnegative.")
         if not math.isfinite(self.ga_redundancy_weight) or self.ga_redundancy_weight < 0.0:
             raise ValueError("ga_redundancy_weight must be nonnegative.")
         if not math.isfinite(self.ga_cost_weight) or self.ga_cost_weight < 0.0:
             raise ValueError("ga_cost_weight must be nonnegative.")
+        if not math.isfinite(self.ga_diversity_weight) or self.ga_diversity_weight < 0.0:
+            raise ValueError("ga_diversity_weight must be nonnegative.")
 
 
 def to_serializable(val):
@@ -734,8 +750,11 @@ def main():
             ga_generations=training_args.ga_generations,
             ga_mutation_rate=training_args.ga_mutation_rate,
             ga_crossover_rate=training_args.ga_crossover_rate,
+            ga_interaction_weight=training_args.ga_interaction_weight,
             ga_redundancy_weight=training_args.ga_redundancy_weight,
             ga_cost_weight=training_args.ga_cost_weight,
+            ga_diversity_weight=training_args.ga_diversity_weight,
+            ga_local_search=training_args.ga_local_search,
             training_seed=training_args.seed,
         )
     else:

@@ -1,0 +1,10 @@
+
+# Local training outputs
+/NLU/output/
+*.log
+**/checkpoint-*/
+**/__pycache__/
+*.py[cod]
+*.bak
+/NLU/runs/
+/NLU/wandb/

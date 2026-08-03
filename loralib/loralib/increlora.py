@@ -281,8 +281,11 @@ class RankAllocator(object):
         ga_generations:int=4,
         ga_mutation_rate:float=0.10,
         ga_crossover_rate:float=0.80,
+        ga_interaction_weight:float=0.20,
         ga_redundancy_weight:float=0.20,
         ga_cost_weight:float=0.30,
+        ga_diversity_weight:float=0.10,
+        ga_local_search:bool=False,
         training_seed:int=42,
     ):
         self.ave_target_rank = target_rank
@@ -313,17 +316,24 @@ class RankAllocator(object):
             raise ValueError("ga_mutation_rate must be between 0 and 1.")
         if not math.isfinite(ga_crossover_rate) or not 0.0 <= ga_crossover_rate <= 1.0:
             raise ValueError("ga_crossover_rate must be between 0 and 1.")
+        if not math.isfinite(ga_interaction_weight) or ga_interaction_weight < 0.0:
+            raise ValueError("ga_interaction_weight must be nonnegative.")
         if not math.isfinite(ga_redundancy_weight) or ga_redundancy_weight < 0.0:
             raise ValueError("ga_redundancy_weight must be nonnegative.")
         if not math.isfinite(ga_cost_weight) or ga_cost_weight < 0.0:
             raise ValueError("ga_cost_weight must be nonnegative.")
+        if not math.isfinite(ga_diversity_weight) or ga_diversity_weight < 0.0:
+            raise ValueError("ga_diversity_weight must be nonnegative.")
         self.rank_allocator = rank_allocator
         self.ga_population = ga_population
         self.ga_generations = ga_generations
         self.ga_mutation_rate = ga_mutation_rate
         self.ga_crossover_rate = ga_crossover_rate
+        self.ga_interaction_weight = ga_interaction_weight
         self.ga_redundancy_weight = ga_redundancy_weight
         self.ga_cost_weight = ga_cost_weight
+        self.ga_diversity_weight = ga_diversity_weight
+        self.ga_local_search = ga_local_search
         self.training_seed = training_seed
 
         self.model = model
@@ -490,82 +500,57 @@ class RankAllocator(object):
                 generations=self.ga_generations,
                 mutation_rate=self.ga_mutation_rate,
                 crossover_rate=self.ga_crossover_rate,
+                interaction_weight=self.ga_interaction_weight,
                 redundancy_weight=self.ga_redundancy_weight,
                 cost_weight=self.ga_cost_weight,
+                diversity_weight=self.ga_diversity_weight,
                 seed=self.training_seed + self.global_step,
                 module_features=module_features,
+                local_search=self.ga_local_search,
             )
             logger.info(
                 "EvoIncreLoRA allocation step=%s allocator=genetic "
-                "selected_modules=%s greedy_modules=%s fitness=%.6f "
-                "importance_reward=%.6f redundancy_score=%.6f "
-                "weighted_redundancy_penalty=%.6f selected_parameter_cost=%.0f "
-                "greedy_parameter_cost=%.0f normalized_cost_penalty=%.6f "
-                "redundancy_features_available=%s redundancy_feature_mode=%s "
-                "selected_set_equals_greedy=%s selected_greedy_jaccard=%.6f "
-                "selected_non_greedy_count=%s unique_population_count_initial=%s "
-                "unique_population_count_final=%s candidate_pair_similarity_min=%.6f "
-                "candidate_pair_similarity_mean=%.6f candidate_pair_similarity_max=%.6f "
-                "greedy_fitness=%s best_non_greedy_fitness=%s "
-                "best_non_greedy_fitness_minus_greedy=%s best_non_greedy_modules=%s "
-                "best_single_swap_fitness=%s best_single_swap_fitness_minus_greedy=%s "
-                "best_single_swap_modules=%s best_single_swap_removed_module=%s "
-                "best_single_swap_added_module=%s ga_found_best_single_swap=%s "
-                "ga_pre_local_fitness=%s local_search_start_source=%s "
-                "local_search_improved=%s local_search_removed_module=%s "
-                "local_search_added_module=%s local_search_fitness_before=%s "
-                "local_search_fitness_after=%s local_search_fitness_gain=%s "
-                "selected_source=%s selected_matches_diagnostic_best_single_swap=%s",
+                "selected_modules=%s greedy_modules=%s ga_best_modules=%s "
+                "greedy_fitness=%s ga_best_fitness=%s ga_beats_greedy=%s "
+                "ga_best_fitness_minus_greedy=%s fitness=%.6f "
+                "importance_reward=%.6f interaction_gain=%.6f "
+                "weighted_interaction_gain=%.6f redundancy_score=%.6f "
+                "weighted_redundancy_penalty=%.6f normalized_cost_penalty=%.6f "
+                "selected_parameter_cost=%.0f population_diversity_initial=%.6f "
+                "population_diversity_final=%.6f unique_population_count_initial=%s "
+                "unique_population_count_final=%s evaluated_unique_chromosome_count=%s "
+                "selected_set_equals_greedy=%s selected_non_greedy_count=%s "
+                "interaction_feature_mode=%s local_search_enabled=%s "
+                "local_search_improved=%s selected_source=%s",
                 self.global_step,
                 selected_modules,
                 greedy_top_h_modules,
+                diagnostics["ga_best_modules"],
+                self._format_diagnostic_float(diagnostics["greedy_fitness"]),
+                self._format_diagnostic_float(diagnostics["ga_best_fitness"]),
+                diagnostics["ga_beats_greedy"],
+                self._format_diagnostic_float(
+                    diagnostics["ga_best_fitness_minus_greedy"]
+                ),
                 diagnostics["total_fitness"],
                 diagnostics["importance_reward"],
+                diagnostics["interaction_gain"],
+                diagnostics["weighted_interaction_gain"],
                 diagnostics["redundancy_score"],
                 diagnostics["weighted_redundancy_penalty"],
-                diagnostics["selected_parameter_cost"],
-                diagnostics["greedy_parameter_cost"],
                 diagnostics["normalized_cost_penalty"],
-                diagnostics["redundancy_features_available"],
-                diagnostics["redundancy_feature_mode"],
-                diagnostics["selected_set_equals_greedy"],
-                diagnostics["selected_greedy_jaccard"],
-                diagnostics["selected_non_greedy_count"],
+                diagnostics["selected_parameter_cost"],
+                diagnostics["population_diversity_initial"],
+                diagnostics["population_diversity_final"],
                 diagnostics["unique_population_count_initial"],
                 diagnostics["unique_population_count_final"],
-                diagnostics["candidate_pair_similarity_min"],
-                diagnostics["candidate_pair_similarity_mean"],
-                diagnostics["candidate_pair_similarity_max"],
-                self._format_diagnostic_float(diagnostics["greedy_fitness"]),
-                self._format_diagnostic_float(diagnostics["best_non_greedy_fitness"]),
-                self._format_diagnostic_float(
-                    diagnostics["best_non_greedy_fitness_minus_greedy"]
-                ),
-                diagnostics["best_non_greedy_modules"],
-                self._format_diagnostic_float(diagnostics["best_single_swap_fitness"]),
-                self._format_diagnostic_float(
-                    diagnostics["best_single_swap_fitness_minus_greedy"]
-                ),
-                diagnostics["best_single_swap_modules"],
-                diagnostics["best_single_swap_removed_module"],
-                diagnostics["best_single_swap_added_module"],
-                diagnostics["ga_found_best_single_swap"],
-                self._format_diagnostic_float(diagnostics["ga_pre_local_fitness"]),
-                diagnostics["local_search_start_source"],
+                diagnostics["evaluated_unique_chromosome_count"],
+                diagnostics["selected_set_equals_greedy"],
+                diagnostics["selected_non_greedy_count"],
+                diagnostics["interaction_feature_mode"],
+                diagnostics["local_search_enabled"],
                 diagnostics["local_search_improved"],
-                diagnostics["local_search_removed_module"],
-                diagnostics["local_search_added_module"],
-                self._format_diagnostic_float(
-                    diagnostics["local_search_fitness_before"]
-                ),
-                self._format_diagnostic_float(
-                    diagnostics["local_search_fitness_after"]
-                ),
-                self._format_diagnostic_float(
-                    diagnostics["local_search_fitness_gain"]
-                ),
                 diagnostics["selected_source"],
-                diagnostics["selected_matches_diagnostic_best_single_swap"],
             )
 
         selected_module_set = set(selected_modules)
