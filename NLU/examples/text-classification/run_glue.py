@@ -18,6 +18,7 @@
 
 import logging
 import ipdb
+import math
 import os
 import random
 import sys
@@ -295,6 +296,51 @@ class TrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "New lr scheduler for new param group"},
     )
+    rank_allocator: str = field(
+        default="greedy",
+        metadata={"help": "Rank allocator: greedy or genetic."},
+    )
+    ga_population: int = field(
+        default=12,
+        metadata={"help": "Population size for the genetic rank allocator."},
+    )
+    ga_generations: int = field(
+        default=4,
+        metadata={"help": "Number of generations for the genetic rank allocator."},
+    )
+    ga_mutation_rate: float = field(
+        default=0.10,
+        metadata={"help": "Replacement-mutation probability for the genetic allocator."},
+    )
+    ga_crossover_rate: float = field(
+        default=0.80,
+        metadata={"help": "Set-aware crossover probability for the genetic allocator."},
+    )
+    ga_redundancy_weight: float = field(
+        default=0.20,
+        metadata={"help": "Weight of the pairwise redundancy penalty."},
+    )
+    ga_cost_weight: float = field(
+        default=0.30,
+        metadata={"help": "Weight of the added-parameter cost penalty."},
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.rank_allocator not in ("greedy", "genetic"):
+            raise ValueError("rank_allocator must be either 'greedy' or 'genetic'.")
+        if self.ga_population <= 0:
+            raise ValueError("ga_population must be positive.")
+        if self.ga_generations < 0:
+            raise ValueError("ga_generations must be nonnegative.")
+        if not math.isfinite(self.ga_mutation_rate) or not 0.0 <= self.ga_mutation_rate <= 1.0:
+            raise ValueError("ga_mutation_rate must be between 0 and 1.")
+        if not math.isfinite(self.ga_crossover_rate) or not 0.0 <= self.ga_crossover_rate <= 1.0:
+            raise ValueError("ga_crossover_rate must be between 0 and 1.")
+        if not math.isfinite(self.ga_redundancy_weight) or self.ga_redundancy_weight < 0.0:
+            raise ValueError("ga_redundancy_weight must be nonnegative.")
+        if not math.isfinite(self.ga_cost_weight) or self.ga_cost_weight < 0.0:
+            raise ValueError("ga_cost_weight must be nonnegative.")
 
 
 def to_serializable(val):
@@ -683,6 +729,14 @@ def main():
             incre_rank_num=training_args.incre_rank_num,
             tb_writter=tb_writter, 
             tb_writter_loginterval=model_args.tb_writter_loginterval,
+            rank_allocator=training_args.rank_allocator,
+            ga_population=training_args.ga_population,
+            ga_generations=training_args.ga_generations,
+            ga_mutation_rate=training_args.ga_mutation_rate,
+            ga_crossover_rate=training_args.ga_crossover_rate,
+            ga_redundancy_weight=training_args.ga_redundancy_weight,
+            ga_cost_weight=training_args.ga_cost_weight,
+            training_seed=training_args.seed,
         )
     else:
         rankallocator = None

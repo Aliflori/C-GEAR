@@ -46,6 +46,107 @@ from .utils import logging
 
 logger = logging.get_logger(__name__)
 
+DYNAMIC_LORA_RANK_PATTERN = "dynamic_lora_rank_pattern"
+_DYNAMIC_LORA_KEY = re.compile(r"(?:^|\.)(?:lora_[AEB]\.\d+|ranknum)$")
+_EXPANDED_DYNAMIC_LORA_KEY = re.compile(r"(?:^|\.)lora_[AEB]\.([1-9]\d*)$")
+
+
+def get_dynamic_lora_rank_pattern(model):
+    pattern = {}
+    for name, module in model.named_modules():
+        metadata_getter = getattr(module, "get_dynamic_lora_metadata", None)
+        if callable(metadata_getter):
+            pattern[name] = metadata_getter()
+    return pattern
+
+
+def restore_dynamic_lora_rank_pattern(model, rank_pattern, checkpoint_path=None):
+    if not isinstance(rank_pattern, dict):
+        raise ValueError("Dynamic LoRA rank metadata must be a dictionary.")
+
+    dynamic_modules = {
+        name: module
+        for name, module in model.named_modules()
+        if callable(getattr(module, "set_dynamic_lora_metadata", None))
+    }
+    pattern_names = set(rank_pattern)
+    module_names = set(dynamic_modules)
+    if pattern_names != module_names:
+        missing_metadata = sorted(module_names.difference(pattern_names))
+        unknown_metadata = sorted(pattern_names.difference(module_names))
+        raise RuntimeError(
+            "Dynamic LoRA rank metadata does not match the model: "
+            "missing_modules={} unknown_modules={}.".format(
+                missing_metadata[:3], unknown_metadata[:3]
+            )
+        )
+
+    for name in sorted(pattern_names):
+        dynamic_modules[name].set_dynamic_lora_metadata(rank_pattern[name])
+
+    active_ranks = [int(rank_pattern[name]["active_rank"]) for name in pattern_names]
+    component_counts = [
+        int(rank_pattern[name]["rank_component_count"]) for name in pattern_names
+    ]
+    logger.info(
+        "Restored dynamic LoRA structure checkpoint=%s modules=%s min_rank=%s "
+        "max_rank=%s total_active_rank=%s total_rank_components=%s",
+        checkpoint_path,
+        len(active_ranks),
+        min(active_ranks) if active_ranks else 0,
+        max(active_ranks) if active_ranks else 0,
+        sum(active_ranks),
+        sum(component_counts),
+    )
+
+
+def validate_dynamic_lora_load_result(
+    missing_keys,
+    unexpected_keys,
+    checkpoint_keys,
+    has_rank_pattern,
+    checkpoint_path=None,
+):
+    dynamic_missing = [key for key in missing_keys if _DYNAMIC_LORA_KEY.search(key)]
+    dynamic_unexpected = [key for key in unexpected_keys if _DYNAMIC_LORA_KEY.search(key)]
+
+    if has_rank_pattern and (dynamic_missing or dynamic_unexpected):
+        raise RuntimeError(
+            "Dynamic LoRA checkpoint loading was incomplete for {}: missing_count={} "
+            "unexpected_count={} missing_sample={} unexpected_sample={}.".format(
+                checkpoint_path,
+                len(dynamic_missing),
+                len(dynamic_unexpected),
+                dynamic_missing[:3],
+                dynamic_unexpected[:3],
+            )
+        )
+
+    checkpoint_dynamic_keys = [
+        key for key in checkpoint_keys if _DYNAMIC_LORA_KEY.search(key)
+    ]
+    if not has_rank_pattern and checkpoint_dynamic_keys:
+        expanded_unexpected = [
+            key for key in dynamic_unexpected if _EXPANDED_DYNAMIC_LORA_KEY.search(key)
+        ]
+        if expanded_unexpected:
+            raise RuntimeError(
+                "Checkpoint {} contains expanded dynamic LoRA components but has no {} "
+                "metadata; exact reconstruction is unavailable. unexpected_count={} "
+                "sample={}.".format(
+                    checkpoint_path,
+                    DYNAMIC_LORA_RANK_PATTERN,
+                    len(expanded_unexpected),
+                    expanded_unexpected[:3],
+                )
+            )
+        logger.warning(
+            "Checkpoint %s has dynamic LoRA parameters but no %s metadata; "
+            "using legacy rank reconstruction.",
+            checkpoint_path,
+            DYNAMIC_LORA_RANK_PATTERN,
+        )
+
 try:
     from torch.nn import Identity
 except ImportError:
@@ -1056,6 +1157,13 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
 
         # Instantiate model.
         model = cls(config, *model_args, **model_kwargs)
+        dynamic_lora_rank_pattern = getattr(config, DYNAMIC_LORA_RANK_PATTERN, None)
+        if dynamic_lora_rank_pattern is not None:
+            restore_dynamic_lora_rank_pattern(
+                model,
+                dynamic_lora_rank_pattern,
+                checkpoint_path=pretrained_model_name_or_path,
+            )
 
         if state_dict is None and not from_tf:
             try:
@@ -1102,6 +1210,8 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
                     new_keys.append(new_key)
             for old_key, new_key in zip(old_keys, new_keys):
                 state_dict[new_key] = state_dict.pop(old_key)
+
+            checkpoint_keys = list(state_dict.keys())
 
             # copy state_dict so _load_from_state_dict can modify it
             metadata = getattr(state_dict, "_metadata", None)
@@ -1153,6 +1263,14 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
             if cls._keys_to_ignore_on_load_unexpected is not None:
                 for pat in cls._keys_to_ignore_on_load_unexpected:
                     unexpected_keys = [k for k in unexpected_keys if re.search(pat, k) is None]
+
+            validate_dynamic_lora_load_result(
+                missing_keys,
+                unexpected_keys,
+                checkpoint_keys,
+                has_rank_pattern=dynamic_lora_rank_pattern is not None,
+                checkpoint_path=pretrained_model_name_or_path,
+            )
 
             if len(unexpected_keys) > 0:
                 logger.warning(

@@ -19,6 +19,7 @@ The Trainer class, to easily train a 🤗 Transformers from scratch or finetune 
 import collections
 import gc
 import inspect
+import json
 import math
 import os
 import random
@@ -58,6 +59,7 @@ from torch.utils.data.sampler import RandomSampler, SequentialSampler
 
 from .data.data_collator import DataCollator, DataCollatorWithPadding, default_data_collator
 from .file_utils import (
+    CONFIG_NAME,
     WEIGHTS_NAME,
     is_apex_available,
     is_datasets_available,
@@ -66,7 +68,13 @@ from .file_utils import (
     is_torch_tpu_available,
     is_training_run_on_sagemaker,
 )
-from .modeling_utils import PreTrainedModel, unwrap_model
+from .modeling_utils import (
+    DYNAMIC_LORA_RANK_PATTERN,
+    PreTrainedModel,
+    get_dynamic_lora_rank_pattern,
+    unwrap_model,
+    validate_dynamic_lora_load_result,
+)
 from .optimization import Adafactor, AdamW, get_scheduler
 from .tokenization_utils_base import PreTrainedTokenizerBase
 from .trainer_callback import (
@@ -884,8 +892,19 @@ class Trainer:
 
         if resume_from_checkpoint is not None and os.path.isfile(os.path.join(resume_from_checkpoint, WEIGHTS_NAME)):
             logger.info(f"Loading model from {resume_from_checkpoint}).")
+            checkpoint_config_file = os.path.join(resume_from_checkpoint, CONFIG_NAME)
+            if os.path.isfile(checkpoint_config_file):
+                with open(checkpoint_config_file, "r", encoding="utf-8") as config_stream:
+                    checkpoint_config = json.load(config_stream)
+                if checkpoint_config.get(DYNAMIC_LORA_RANK_PATTERN) is not None:
+                    raise RuntimeError(
+                        "resume_from_checkpoint is not supported for dynamic IncreLoRA checkpoints: "
+                        "restoring allocator state and optimizer parameter-group ordering is required."
+                    )
             state_dict = torch.load(os.path.join(resume_from_checkpoint, WEIGHTS_NAME), map_location="cpu")
-            self._load_state_dict_in_model(state_dict)
+            self._load_state_dict_in_model(
+                state_dict, checkpoint_path=resume_from_checkpoint, has_rank_pattern=False
+            )
             del state_dict
 
         # If model was re-initialized, put it on the right device and update self.model_wrapped
@@ -1608,6 +1627,27 @@ class Trainer:
 
         Will only save from the main process.
         """
+        if self.is_world_process_zero():
+            model_to_save = unwrap_model(self.model)
+            rank_pattern = get_dynamic_lora_rank_pattern(model_to_save)
+            if rank_pattern:
+                setattr(model_to_save.config, DYNAMIC_LORA_RANK_PATTERN, rank_pattern)
+                active_ranks = [
+                    int(metadata["active_rank"]) for metadata in rank_pattern.values()
+                ]
+                component_counts = [
+                    int(metadata["rank_component_count"])
+                    for metadata in rank_pattern.values()
+                ]
+                logger.info(
+                    "Saved dynamic LoRA rank metadata modules=%s min_rank=%s max_rank=%s "
+                    "total_active_rank=%s total_rank_components=%s",
+                    len(active_ranks),
+                    min(active_ranks),
+                    max(active_ranks),
+                    sum(active_ranks),
+                    sum(component_counts),
+                )
         if is_torch_tpu_available():
             self._save_tpu(output_dir)
         elif (
@@ -2061,8 +2101,18 @@ class Trainer:
         else:
             return 0
 
-    def _load_state_dict_in_model(self, state_dict):
+    def _load_state_dict_in_model(
+        self, state_dict, checkpoint_path=None, has_rank_pattern=False
+    ):
         load_result = self.model.load_state_dict(state_dict, strict=False)
+
+        validate_dynamic_lora_load_result(
+            load_result.missing_keys,
+            load_result.unexpected_keys,
+            list(state_dict.keys()),
+            has_rank_pattern=has_rank_pattern,
+            checkpoint_path=checkpoint_path,
+        )
 
         if len(load_result.missing_keys) != 0:
             if set(load_result.missing_keys) == set(self.model._keys_to_ignore_on_save):
