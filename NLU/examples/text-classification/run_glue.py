@@ -45,6 +45,10 @@ from transformers import (
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
+from transformers.modeling_utils import (
+    DYNAMIC_LORA_RANK_PATTERN,
+    is_dynamic_lora_parameter_name,
+)
 from transformers.utils import check_min_version
 from loralib import RankAllocator 
 
@@ -298,7 +302,12 @@ class TrainingArguments(TrainingArguments):
     )
     rank_allocator: str = field(
         default="greedy",
-        metadata={"help": "Rank allocator: greedy or genetic."},
+        metadata={
+            "help": (
+                "Rank allocator: greedy, genetic, genetic_budgeted, or "
+                "genetic_budgeted_calibrated."
+            )
+        },
     )
     ga_population: int = field(
         default=12,
@@ -336,11 +345,107 @@ class TrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Enable one-swap local refinement for ablation only."},
     )
+    ga_budget_reference_pattern: Optional[str] = field(
+        default=None,
+        metadata={"help": "Matched Greedy rank_pattern.json used only to derive a hard budget."},
+    )
+    ga_max_final_trainable_params: Optional[int] = field(
+        default=None,
+        metadata={"help": "Explicit hard maximum for final total trainable parameters."},
+    )
+    ga_budget_ratio: float = field(
+        default=0.98,
+        metadata={"help": "Fraction of the matched Greedy parameter cost allowed in budgeted modes."},
+    )
+    ga_gain_tolerance: float = field(
+        default=0.05,
+        metadata={"help": "Normalized training-gain tolerance for the budgeted quality guard."},
+    )
+    ga_allow_variable_event_rank: bool = field(
+        default=False,
+        metadata={"help": "Allow calibrated allocation events to select k=0 through top_h modules."},
+    )
+    ga_max_greedy_replacements: int = field(
+        default=2,
+        metadata={"help": "Maximum replacements in a calibrated Greedy-neighborhood chromosome."},
+    )
+    ga_calibration_batches: int = field(
+        default=3,
+        metadata={"help": "Number of deterministic paired training-only calibration folds."},
+    )
+    ga_calibration_batch_size: int = field(
+        default=8,
+        metadata={"help": "Training examples per calibration batch."},
+    )
+    ga_calibration_seed_offset: int = field(
+        default=1000,
+        metadata={"help": "Deterministic offset added to the training seed for calibration sampling."},
+    )
+    ga_calibration_topk: int = field(
+        default=6,
+        metadata={"help": "Maximum positive-rank candidates reranked by virtual calibration."},
+    )
+    ga_calibration_lcb_beta: float = field(
+        default=0.5,
+        metadata={"help": "Standard-deviation penalty in the calibrated lower-confidence score."},
+    )
+    ga_quality_absolute_tolerance: float = field(
+        default=0.0,
+        metadata={"help": "Absolute calibrated-quality equivalence tolerance."},
+    )
+    ga_quality_relative_tolerance: float = field(
+        default=0.01,
+        metadata={"help": "Relative calibrated-quality equivalence tolerance."},
+    )
+    ga_greedy_quality_floor_ratio: float = field(
+        default=0.99,
+        metadata={"help": "Minimum calibrated-quality ratio relative to the Greedy anchor."},
+    )
+    ga_greedy_quality_floor_absolute: float = field(
+        default=0.0,
+        metadata={"help": "Absolute calibrated-quality allowance below the Greedy anchor."},
+    )
+    ga_min_calibrated_marginal_gain: float = field(
+        default=0.0,
+        metadata={"help": "Minimum reliable calibrated LCB required for positive rank growth."},
+    )
+    ga_allocation_stop_patience: int = field(
+        default=2,
+        metadata={"help": "Consecutive zero-rank events before allocation stops permanently."},
+    )
+    ga_min_event_rank: int = field(
+        default=1,
+        metadata={"help": "Minimum positive calibrated event cardinality."},
+    )
+    ga_max_event_rank: Optional[int] = field(
+        default=None,
+        metadata={"help": "Maximum calibrated event cardinality; defaults to top_h."},
+    )
+    ga_min_consolidation_steps: int = field(
+        default=300,
+        metadata={"help": "Minimum fixed-architecture training window at the end of training."},
+    )
+    ga_new_rank_lr_warmup_steps: int = field(
+        default=25,
+        metadata={"help": "Effective learning-rate warmup steps for newly activated LoRA components."},
+    )
+    greedy_reference_checkpoint: Optional[str] = field(
+        default=None,
+        metadata={"help": "Matched Greedy best checkpoint used only for post-training parameter reporting."},
+    )
 
     def __post_init__(self):
         super().__post_init__()
-        if self.rank_allocator not in ("greedy", "genetic"):
-            raise ValueError("rank_allocator must be either 'greedy' or 'genetic'.")
+        if self.rank_allocator not in (
+            "greedy",
+            "genetic",
+            "genetic_budgeted",
+            "genetic_budgeted_calibrated",
+        ):
+            raise ValueError(
+                "rank_allocator must be 'greedy', 'genetic', 'genetic_budgeted', or "
+                "'genetic_budgeted_calibrated'."
+            )
         if self.ga_population <= 0:
             raise ValueError("ga_population must be positive.")
         if self.ga_generations < 0:
@@ -357,6 +462,59 @@ class TrainingArguments(TrainingArguments):
             raise ValueError("ga_cost_weight must be nonnegative.")
         if not math.isfinite(self.ga_diversity_weight) or self.ga_diversity_weight < 0.0:
             raise ValueError("ga_diversity_weight must be nonnegative.")
+        if not math.isfinite(self.ga_budget_ratio) or not 0.0 < self.ga_budget_ratio <= 1.0:
+            raise ValueError("ga_budget_ratio must be greater than 0 and at most 1.")
+        if not math.isfinite(self.ga_gain_tolerance) or not 0.0 <= self.ga_gain_tolerance <= 1.0:
+            raise ValueError("ga_gain_tolerance must be between 0 and 1.")
+        if self.rank_allocator == "genetic_budgeted" and self.ga_local_search:
+            raise ValueError("genetic_budgeted requires ga_local_search=false.")
+        if self.rank_allocator == "genetic_budgeted" and self.ga_allow_variable_event_rank:
+            raise ValueError("Variable event rank is not implemented; preserve the fixed schedule.")
+        if self.rank_allocator == "genetic_budgeted_calibrated" and self.ga_local_search:
+            raise ValueError("genetic_budgeted_calibrated requires ga_local_search=false.")
+        if self.rank_allocator == "genetic_budgeted_calibrated" and not self.ga_allow_variable_event_rank:
+            raise ValueError("genetic_budgeted_calibrated requires ga_allow_variable_event_rank=true.")
+        if self.rank_allocator in ("greedy", "genetic") and self.ga_allow_variable_event_rank:
+            raise ValueError("Variable event rank is disabled for greedy and genetic allocators.")
+        if (
+            self.rank_allocator in ("genetic_budgeted", "genetic_budgeted_calibrated")
+            and self.ga_budget_reference_pattern is None
+            and self.ga_max_final_trainable_params is None
+        ):
+            raise ValueError(
+                "%s requires ga_budget_reference_pattern or "
+                "ga_max_final_trainable_params."
+                % self.rank_allocator
+            )
+        if self.ga_max_greedy_replacements < 0:
+            raise ValueError("ga_max_greedy_replacements must be nonnegative.")
+        if self.ga_calibration_batches <= 0 or self.ga_calibration_batch_size <= 0:
+            raise ValueError("Calibration batch count and batch size must be positive.")
+        if self.ga_calibration_topk < 6:
+            raise ValueError("ga_calibration_topk must be at least 6.")
+        for name, value in (
+            ("ga_calibration_lcb_beta", self.ga_calibration_lcb_beta),
+            ("ga_quality_absolute_tolerance", self.ga_quality_absolute_tolerance),
+            ("ga_quality_relative_tolerance", self.ga_quality_relative_tolerance),
+            ("ga_greedy_quality_floor_absolute", self.ga_greedy_quality_floor_absolute),
+        ):
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError("%s must be finite and nonnegative." % name)
+        if (
+            not math.isfinite(self.ga_greedy_quality_floor_ratio)
+            or not 0.0 <= self.ga_greedy_quality_floor_ratio <= 1.0
+        ):
+            raise ValueError("ga_greedy_quality_floor_ratio must be between 0 and 1.")
+        if not math.isfinite(self.ga_min_calibrated_marginal_gain):
+            raise ValueError("ga_min_calibrated_marginal_gain must be finite.")
+        if self.ga_allocation_stop_patience <= 0:
+            raise ValueError("ga_allocation_stop_patience must be positive.")
+        if self.ga_min_event_rank <= 0:
+            raise ValueError("ga_min_event_rank must be positive.")
+        if self.ga_max_event_rank is not None and self.ga_max_event_rank < self.ga_min_event_rank:
+            raise ValueError("ga_max_event_rank must be at least ga_min_event_rank.")
+        if self.ga_min_consolidation_steps < 0 or self.ga_new_rank_lr_warmup_steps < 0:
+            raise ValueError("Consolidation and new-rank warmup steps must be nonnegative.")
 
 
 def to_serializable(val):
@@ -515,8 +673,19 @@ def main():
     #
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
+    calibrated_resume_checkpoint = (
+        last_checkpoint
+        if training_args.rank_allocator == "genetic_budgeted_calibrated"
+        else None
+    )
+    model_load_path = calibrated_resume_checkpoint or model_args.model_name_or_path
+    config_load_path = (
+        calibrated_resume_checkpoint
+        or model_args.config_name
+        or model_args.model_name_or_path
+    )
     config = AutoConfig.from_pretrained(
-        model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+        config_load_path,
         num_labels=num_labels,
         finetuning_task=data_args.task_name,
         cache_dir=model_args.cache_dir,
@@ -543,8 +712,8 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
     )
     model = AutoModelForSequenceClassification.from_pretrained(
-        model_args.model_name_or_path,
-        from_tf=bool(".ckpt" in model_args.model_name_or_path),
+        model_load_path,
+        from_tf=bool(".ckpt" in model_load_path),
         config=config,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
@@ -586,9 +755,17 @@ def main():
         trainable_params.append('bias')
 
     num_param = 0 
+    restored_dynamic_rank_pattern = getattr(model.config, DYNAMIC_LORA_RANK_PATTERN, None)
     if len(trainable_params) > 0:
         for name, param in model.named_parameters():
             if name.startswith('deberta') or name.startswith('roberta'):
+                if restored_dynamic_rank_pattern is not None and is_dynamic_lora_parameter_name(name):
+                    if param.requires_grad:
+                        sub_num_param = 1
+                        for dim in param.shape:
+                            sub_num_param *= dim
+                        num_param += sub_num_param
+                    continue
                 param.requires_grad = False
                 for trainable_param in trainable_params:
                     if trainable_param in name:
@@ -755,6 +932,28 @@ def main():
             ga_cost_weight=training_args.ga_cost_weight,
             ga_diversity_weight=training_args.ga_diversity_weight,
             ga_local_search=training_args.ga_local_search,
+            ga_budget_reference_pattern=training_args.ga_budget_reference_pattern,
+            ga_max_final_trainable_params=training_args.ga_max_final_trainable_params,
+            ga_budget_ratio=training_args.ga_budget_ratio,
+            ga_gain_tolerance=training_args.ga_gain_tolerance,
+            ga_allow_variable_event_rank=training_args.ga_allow_variable_event_rank,
+            ga_max_greedy_replacements=training_args.ga_max_greedy_replacements,
+            ga_calibration_batches=training_args.ga_calibration_batches,
+            ga_calibration_batch_size=training_args.ga_calibration_batch_size,
+            ga_calibration_seed_offset=training_args.ga_calibration_seed_offset,
+            ga_calibration_topk=training_args.ga_calibration_topk,
+            ga_calibration_lcb_beta=training_args.ga_calibration_lcb_beta,
+            ga_quality_absolute_tolerance=training_args.ga_quality_absolute_tolerance,
+            ga_quality_relative_tolerance=training_args.ga_quality_relative_tolerance,
+            ga_greedy_quality_floor_ratio=training_args.ga_greedy_quality_floor_ratio,
+            ga_greedy_quality_floor_absolute=training_args.ga_greedy_quality_floor_absolute,
+            ga_min_calibrated_marginal_gain=training_args.ga_min_calibrated_marginal_gain,
+            ga_allocation_stop_patience=training_args.ga_allocation_stop_patience,
+            ga_min_event_rank=training_args.ga_min_event_rank,
+            ga_max_event_rank=training_args.ga_max_event_rank,
+            ga_min_consolidation_steps=training_args.ga_min_consolidation_steps,
+            ga_new_rank_lr_warmup_steps=training_args.ga_new_rank_lr_warmup_steps,
+            greedy_reference_checkpoint=training_args.greedy_reference_checkpoint,
             training_seed=training_args.seed,
         )
     else:
@@ -775,6 +974,8 @@ def main():
     )
 
 
+    budget_finalized = False
+
     # Training
     if training_args.do_train:
         checkpoint = None
@@ -792,6 +993,13 @@ def main():
             data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
         )
         metrics["train_samples"] = min(max_train_samples, len(train_dataset))
+
+        if rankallocator is not None and training_args.rank_allocator in (
+            "genetic_budgeted",
+            "genetic_budgeted_calibrated",
+        ):
+            rankallocator.finalize_budget(trainer.model)
+            budget_finalized = True
 
         trainer.save_model()  # Saves the tokenizer too for easy upload
 
@@ -855,9 +1063,40 @@ def main():
         tb_writter.close() 
 
     if rankallocator is not None and is_main_process(training_args.local_rank):
+        if training_args.rank_allocator in (
+            "genetic_budgeted",
+            "genetic_budgeted_calibrated",
+        ) and not budget_finalized:
+            rankallocator.finalize_budget(trainer.model)
         rank_pattern = rankallocator.get_rank_pattern()
-        with open(os.path.join(training_args.root_output_dir, "rank_pattern.json"), "w") as f:
+        rank_pattern_path = os.path.join(
+            training_args.root_output_dir, "rank_pattern.json"
+        )
+        with open(rank_pattern_path, "w") as f:
             json.dump(rank_pattern, f) 
+        if (
+            training_args.rank_allocator == "genetic_budgeted_calibrated"
+            and training_args.greedy_reference_checkpoint is not None
+        ):
+            from transformers.rank_budget_reporting import build_rank_budget_report
+
+            parameter_report = build_rank_budget_report(
+                budgeted_trainer_state=os.path.join(
+                    training_args.output_dir, "trainer_state.json"
+                ),
+                budgeted_rank_pattern=rank_pattern_path,
+                greedy_reference_checkpoint=training_args.greedy_reference_checkpoint,
+                greedy_reference_rank_pattern=training_args.ga_budget_reference_pattern,
+            )
+            report_path = os.path.join(
+                training_args.root_output_dir, "parameter_comparison.json"
+            )
+            with open(report_path, "w", encoding="utf-8") as report_stream:
+                json.dump(parameter_report, report_stream, indent=2, sort_keys=True)
+            logger.info(
+                "Calibrated matched parameter report=%s",
+                parameter_report,
+            )
 
 
 def _mp_fn(index):

@@ -69,9 +69,12 @@ from .file_utils import (
     is_training_run_on_sagemaker,
 )
 from .modeling_utils import (
+    DYNAMIC_LORA_NON_DYNAMIC_TRAINABILITY,
     DYNAMIC_LORA_RANK_PATTERN,
     PreTrainedModel,
     get_dynamic_lora_rank_pattern,
+    get_non_dynamic_parameter_trainability,
+    restore_non_dynamic_parameter_trainability,
     unwrap_model,
     validate_dynamic_lora_load_result,
 )
@@ -341,6 +344,9 @@ class Trainer:
         self.rankallocator = rankallocator 
         self.model_args = model_args 
         self.tb_writter = tb_writter 
+        self._rank_calibration_batch_pairs = None
+        self._calibrated_resume_rng_state = None
+        self._best_model_was_loaded = False
 
         # postpone switching model to cuda when:
         # 1. MP - since we are trying to fit a much bigger than 1 gpu model
@@ -525,6 +531,22 @@ class Trainer:
 
         else:
             if self.args.world_size <= 1:
+                if (
+                    self.rankallocator is not None
+                    and getattr(self.rankallocator, "rank_allocator", None)
+                    == "genetic_budgeted_calibrated"
+                ):
+                    # Epoch-addressable permutations are independent of global
+                    # RNG consumed by dynamic checkpoint reconstruction. The
+                    # outer training loop calls set_epoch(epoch), after which
+                    # current-epoch batch skipping reproduces the exact position.
+                    return DistributedSampler(
+                        self.train_dataset,
+                        num_replicas=1,
+                        rank=0,
+                        shuffle=True,
+                        seed=self.args.seed,
+                    )
                 return RandomSampler(self.train_dataset)
             elif self.args.parallel_mode == ParallelMode.TPU and not self.args.dataloader_drop_last:
                 # Use a loop for TPUs when drop_last is False to have all batches have the same size.
@@ -570,6 +592,155 @@ class Trainer:
             worker_init_fn=seed_worker,
             generator=g
         )
+
+    def _prepare_rank_allocator_calibration_batches(self):
+        """Build fixed paired batches exclusively from the training dataset."""
+
+        if (
+            self.rankallocator is None
+            or getattr(self.rankallocator, "rank_allocator", None)
+            != "genetic_budgeted_calibrated"
+        ):
+            self._rank_calibration_batch_pairs = None
+            return None
+        if self.args.deepspeed or self.use_apex:
+            raise ValueError(
+                "genetic_budgeted_calibrated currently requires native PyTorch/AMP "
+                "optimization so virtual AdamW calibration can restore state exactly."
+            )
+        if self.args.adafactor:
+            raise ValueError(
+                "genetic_budgeted_calibrated requires the repository AdamW optimizer; "
+                "Adafactor is not supported by virtual calibration."
+            )
+        if self.args.ignore_data_skip:
+            raise ValueError(
+                "genetic_budgeted_calibrated requires ignore_data_skip=false for "
+                "deterministic checkpoint resume."
+            )
+        if self.args.group_by_length:
+            raise ValueError(
+                "genetic_budgeted_calibrated does not support group_by_length; "
+                "its sampler state is not reconstructed for exact resume."
+            )
+        if self.args.dataloader_num_workers != 0:
+            raise ValueError(
+                "genetic_budgeted_calibrated requires dataloader_num_workers=0; "
+                "worker prefetch/RNG state is not checkpointed."
+            )
+        if (
+            self.args.local_rank != -1
+            or self.args.world_size != 1
+            or is_torch_tpu_available()
+            or self.sharded_ddp is not None
+        ):
+            raise ValueError(
+                "genetic_budgeted_calibrated currently supports one native PyTorch "
+                "process only; distributed, sharded, and TPU allocation decisions "
+                "are not synchronized."
+            )
+        if self.train_dataset is None or not isinstance(
+            self.train_dataset, collections.abc.Sized
+        ):
+            raise ValueError(
+                "genetic_budgeted_calibrated requires a sized training dataset."
+            )
+        fingerprint = getattr(self.train_dataset, "_fingerprint", None)
+        index_pairs = self.rankallocator.get_or_create_calibration_indices(
+            len(self.train_dataset), dataset_fingerprint=fingerprint
+        )
+        batch_pairs = []
+        for pair in index_pairs:
+            batch_a = self.data_collator(
+                [self.train_dataset[index] for index in pair["batch_a"]]
+            )
+            batch_b = self.data_collator(
+                [self.train_dataset[index] for index in pair["batch_b"]]
+            )
+            batch_pairs.append((batch_a, batch_b))
+        self._rank_calibration_batch_pairs = batch_pairs
+        return batch_pairs
+
+    def _rank_allocator_calibration_loss(self, model, inputs):
+        """Compute the real training objective without exposing evaluation data."""
+
+        had_past = hasattr(self, "_past")
+        saved_past = getattr(self, "_past", None)
+        try:
+            inputs = dict(inputs)
+            inputs = self._prepare_inputs(inputs)
+            if self.use_amp:
+                with autocast():
+                    return self.compute_loss(model, inputs)
+            return self.compute_loss(model, inputs)
+        finally:
+            if had_past:
+                self._past = saved_past
+            elif hasattr(self, "_past"):
+                delattr(self, "_past")
+
+    def _calibrated_rng_state_dict(self):
+        return {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": (
+                torch.cuda.get_rng_state_all()
+                if torch.cuda.is_available() and torch.cuda.is_initialized()
+                else None
+            ),
+        }
+
+    def _load_calibrated_rng_state_file(self, checkpoint):
+        if (
+            self.rankallocator is None
+            or getattr(self.rankallocator, "rank_allocator", None)
+            != "genetic_budgeted_calibrated"
+            or checkpoint is None
+        ):
+            return
+        path = os.path.join(checkpoint, "rng_state.pth")
+        if not os.path.isfile(path):
+            raise ValueError(
+                "Calibrated resume checkpoint is missing deterministic RNG state: %s"
+                % path
+            )
+        self._calibrated_resume_rng_state = torch.load(path, map_location="cpu")
+
+    def _load_calibrated_scaler_state_file(self, checkpoint):
+        if (
+            self.rankallocator is None
+            or getattr(self.rankallocator, "rank_allocator", None)
+            != "genetic_budgeted_calibrated"
+            or checkpoint is None
+            or not self.use_amp
+        ):
+            return
+        path = os.path.join(checkpoint, "scaler.pt")
+        if not os.path.isfile(path):
+            raise ValueError(
+                "Calibrated fp16 resume checkpoint is missing GradScaler state: %s"
+                % path
+            )
+        self.scaler.load_state_dict(torch.load(path, map_location="cpu"))
+        logger.info("Restored calibrated GradScaler state from %s.", path)
+
+    def _restore_calibrated_resume_rng_state(self):
+        state = self._calibrated_resume_rng_state
+        if state is None:
+            return
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch_cpu"])
+        cuda_state = state.get("torch_cuda")
+        if cuda_state is not None:
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "Calibrated checkpoint contains CUDA RNG state but CUDA is unavailable."
+                )
+            torch.cuda.set_rng_state_all(cuda_state)
+        self._calibrated_resume_rng_state = None
+        logger.info("Restored calibrated checkpoint RNG state immediately before resumed training.")
 
     def _get_eval_sampler(self, eval_dataset: Dataset) -> Optional[torch.utils.data.sampler.Sampler]:
         if is_torch_tpu_available():
@@ -693,6 +864,24 @@ class Trainer:
         """
         if self.optimizer is None:
             self.optimizer = self.create_optimizer()
+            if (
+                self.rankallocator is not None
+                and getattr(self.rankallocator, "rank_allocator", None)
+                == "genetic_budgeted_calibrated"
+            ):
+                self.rankallocator.prepare_optimizer_for_resume(
+                    self.model, self.optimizer
+                )
+
+        if (
+            self.rankallocator is not None
+            and getattr(self.rankallocator, "rank_allocator", None)
+            == "genetic_budgeted_calibrated"
+            and not isinstance(self.optimizer, AdamW)
+        ):
+            raise ValueError(
+                "genetic_budgeted_calibrated requires the repository's AdamW optimizer."
+            )
 
         if self.lr_scheduler is None:
             self.lr_scheduler = self.create_scheduler(
@@ -896,16 +1085,39 @@ class Trainer:
             if os.path.isfile(checkpoint_config_file):
                 with open(checkpoint_config_file, "r", encoding="utf-8") as config_stream:
                     checkpoint_config = json.load(config_stream)
-                if checkpoint_config.get(DYNAMIC_LORA_RANK_PATTERN) is not None:
+                dynamic_checkpoint = checkpoint_config.get(DYNAMIC_LORA_RANK_PATTERN) is not None
+                calibrated_resume = (
+                    dynamic_checkpoint
+                    and self.rankallocator is not None
+                    and getattr(self.rankallocator, "rank_allocator", None)
+                    == "genetic_budgeted_calibrated"
+                    and getattr(self.rankallocator, "_loaded_calibrated_metadata", None)
+                    is not None
+                )
+                if dynamic_checkpoint and not calibrated_resume:
                     raise RuntimeError(
-                        "resume_from_checkpoint is not supported for dynamic IncreLoRA checkpoints: "
-                        "restoring allocator state and optimizer parameter-group ordering is required."
+                        "resume_from_checkpoint is not supported for this dynamic IncreLoRA mode: "
+                        "only genetic_budgeted_calibrated checkpoints carry the required allocator "
+                        "and optimizer-layout state."
                     )
-            state_dict = torch.load(os.path.join(resume_from_checkpoint, WEIGHTS_NAME), map_location="cpu")
-            self._load_state_dict_in_model(
-                state_dict, checkpoint_path=resume_from_checkpoint, has_rank_pattern=False
-            )
-            del state_dict
+            else:
+                dynamic_checkpoint = False
+                calibrated_resume = False
+            if not calibrated_resume:
+                state_dict = torch.load(
+                    os.path.join(resume_from_checkpoint, WEIGHTS_NAME), map_location="cpu"
+                )
+                self._load_state_dict_in_model(
+                    state_dict,
+                    checkpoint_path=resume_from_checkpoint,
+                    has_rank_pattern=False,
+                )
+                del state_dict
+            else:
+                logger.info(
+                    "Using calibrated dynamic model already reconstructed from checkpoint=%s.",
+                    resume_from_checkpoint,
+                )
 
         # If model was re-initialized, put it on the right device and update self.model_wrapped
         if model_reloaded:
@@ -918,6 +1130,7 @@ class Trainer:
 
         # Data loader and number of training steps
         train_dataloader = self.get_train_dataloader()
+        self._prepare_rank_allocator_calibration_batches()
 
         # Setting up training control variables:
         # number of training epochs: num_train_epochs
@@ -957,6 +1170,60 @@ class Trainer:
 
         if self.rankallocator is not None: 
             self.rankallocator.set_total_step(max_steps)
+            if (
+                getattr(self.rankallocator, "rank_allocator", None)
+                == "genetic_budgeted_calibrated"
+            ):
+                scheduler_type = self.args.lr_scheduler_type
+                if hasattr(scheduler_type, "value"):
+                    scheduler_type = scheduler_type.value
+                self.rankallocator.set_training_configuration(
+                    {
+                        "optimizer": "transformers_adamw",
+                        "learning_rate": float(self.args.learning_rate),
+                        "adam_beta1": float(self.args.adam_beta1),
+                        "adam_beta2": float(self.args.adam_beta2),
+                        "adam_epsilon": float(self.args.adam_epsilon),
+                        "weight_decay": float(self.args.weight_decay),
+                        "max_grad_norm": (
+                            None
+                            if self.args.max_grad_norm is None
+                            else float(self.args.max_grad_norm)
+                        ),
+                        "fp16": bool(self.args.fp16),
+                        "gradient_accumulation_steps": int(
+                            self.args.gradient_accumulation_steps
+                        ),
+                        "train_batch_size": int(self.args.train_batch_size),
+                        "dataloader_drop_last": bool(self.args.dataloader_drop_last),
+                        "dataloader_num_workers": int(
+                            self.args.dataloader_num_workers
+                        ),
+                        "ignore_data_skip": bool(self.args.ignore_data_skip),
+                        "lr_scheduler_type": str(scheduler_type),
+                        "warmup_steps": int(self.args.warmup_steps),
+                        "warmup_ratio": float(self.args.warmup_ratio),
+                        "multi_lr": bool(self.args.multi_lr),
+                        "seed": int(self.args.seed),
+                        "label_smoothing_factor": float(
+                            self.args.label_smoothing_factor
+                        ),
+                        "cls_dropout": getattr(self.args, "cls_dropout", None),
+                        "lora_type": getattr(self.model_args, "lora_type", None),
+                        "lora_alpha": getattr(self.model_args, "lora_alpha", None),
+                        "lora_dropout": getattr(self.model_args, "lora_dropout", None),
+                        "lora_module": getattr(self.model_args, "lora_module", None),
+                        "reg_orth_coef": getattr(
+                            self.model_args, "reg_orth_coef", None
+                        ),
+                        "reg_loss_wgt": getattr(
+                            self.model_args, "reg_loss_wgt", None
+                        ),
+                        "masking_prob": getattr(
+                            self.model_args, "masking_prob", None
+                        ),
+                    }
+                )
 
         # for the rest of this function `model` is the outside model, whether it was wrapped or not
         if model is not self.model:
@@ -967,6 +1234,8 @@ class Trainer:
 
         # Check if saved optimizer or scheduler states exist
         self._load_optimizer_and_scheduler(resume_from_checkpoint)
+        self._load_calibrated_scaler_state_file(resume_from_checkpoint)
+        self._load_calibrated_rng_state_file(resume_from_checkpoint)
 
         # important: at this point:
         # self.model         is the Transformers Model
@@ -1083,6 +1352,10 @@ class Trainer:
                     steps_trained_in_current_epoch -= 1
                     continue
 
+                # Restore after sampler/iterator creation and data skipping so
+                # the first resumed forward sees the uninterrupted RNG state.
+                self._restore_calibrated_resume_rng_state()
+
                 if (step + 1) % self.args.gradient_accumulation_steps == 0:
                     self.control = self.callback_handler.on_step_begin(self.args, self.state, self.control)
 
@@ -1107,11 +1380,21 @@ class Trainer:
                     steps_in_epoch <= self.args.gradient_accumulation_steps
                     and (step + 1) == steps_in_epoch
                 ):
+                    calibrated_allocator_active = (
+                        self.rankallocator is not None
+                        and getattr(self.rankallocator, "rank_allocator", None)
+                        == "genetic_budgeted_calibrated"
+                    )
+                    if self.use_amp and calibrated_allocator_active:
+                        # Calibration consumes optimizer-aware unscaled gradients
+                        # even when clipping is disabled. GradScaler.step() will
+                        # reuse this unscale result and must not be called twice.
+                        self.scaler.unscale_(self.optimizer)
                     # Gradient clipping
                     if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0 and not self.deepspeed:
                         # deepspeed does its own clipping
 
-                        if self.use_amp:
+                        if self.use_amp and not calibrated_allocator_active:
                             # AMP: gradients need unscaling
                             self.scaler.unscale_(self.optimizer)
 
@@ -1131,18 +1414,84 @@ class Trainer:
 
                     if self.rankallocator is not None:
                         # Apply IncreLoRA to allocate the budget 
-                        curr_rank, incre_threshold = self.rankallocator.update_and_increase(self.model, self.state.global_step, self.optimizer)
+                        if (
+                            getattr(self.rankallocator, "rank_allocator", None)
+                            == "genetic_budgeted_calibrated"
+                        ):
+                            finite_flags = [
+                                torch.isfinite(parameter.grad).all()
+                                for parameter in self.model.parameters()
+                                if parameter.grad is not None
+                            ]
+                            gradients_are_finite = (
+                                True
+                                if not finite_flags
+                                else bool(
+                                    torch.stack(
+                                        [
+                                            flag.to(finite_flags[0].device)
+                                            for flag in finite_flags
+                                        ]
+                                    )
+                                    .all()
+                                    .item()
+                                )
+                            )
+                            if gradients_are_finite:
+                                curr_rank, incre_threshold = self.rankallocator.update_and_increase(
+                                    self.model,
+                                    self.state.global_step,
+                                    self.optimizer,
+                                    lr_scheduler=self.lr_scheduler,
+                                    calibration_batch_pairs=self._rank_calibration_batch_pairs,
+                                    calibration_loss_fn=self._rank_allocator_calibration_loss,
+                                    max_grad_norm=self.args.max_grad_norm,
+                                    amp_loss_scale=(
+                                        float(self.scaler.get_scale())
+                                        if self.use_amp
+                                        else 1.0
+                                    ),
+                                )
+                            else:
+                                curr_rank, incre_threshold = 0, None
+                                logger.warning(
+                                    "Skipped calibrated allocator update at global_step=%s "
+                                    "because unscaled training gradients are non-finite.",
+                                    self.state.global_step,
+                                )
+                            self.rankallocator.snapshot_new_rank_warmup_parameters(
+                                self.model
+                            )
+                        else:
+                            curr_rank, incre_threshold = self.rankallocator.update_and_increase(
+                                self.model, self.state.global_step, self.optimizer
+                            )
                     
                     # Optimizer step
+                    optimizer_step_was_run = True
                     if self.deepspeed:
                         pass  # called outside the loop
                     elif is_torch_tpu_available():
                         xm.optimizer_step(self.optimizer)
                     elif self.use_amp:
+                        scale_before_step = self.scaler.get_scale()
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
+                        optimizer_step_was_run = (
+                            self.scaler.get_scale() >= scale_before_step
+                        )
                     else:
                         self.optimizer.step()
+
+                    if (
+                        self.rankallocator is not None
+                        and getattr(self.rankallocator, "rank_allocator", None)
+                        == "genetic_budgeted_calibrated"
+                    ):
+                        self.rankallocator.apply_new_rank_lr_warmup(
+                            self.model,
+                            optimizer_step_was_run=optimizer_step_was_run,
+                        )
 
                     if not self.deepspeed:
                         self.lr_scheduler.step()
@@ -1179,6 +1528,15 @@ class Trainer:
             delattr(self, "_past")
 
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
+        if (
+            self.rankallocator is not None
+            and getattr(self.rankallocator, "rank_allocator", None)
+            == "genetic_budgeted_calibrated"
+        ):
+            self.rankallocator.record_final_trajectory(
+                self.model, global_step=self.state.global_step
+            )
+            self.rankallocator._save_budget_metadata(self.model)
         if self.args.load_best_model_at_end and self.state.best_model_checkpoint is not None:
             # Wait for everyone to get here so we are sur the model has been saved by process 0.
             if is_torch_tpu_available():
@@ -1189,13 +1547,7 @@ class Trainer:
             logger.info(
                 f"Loading best model from {self.state.best_model_checkpoint} (score: {self.state.best_metric})."
             )
-            if isinstance(self.model, PreTrainedModel):
-                self.model = self.model.from_pretrained(self.state.best_model_checkpoint)
-                if self.place_model_on_device:
-                    self.model = self.model.to(self.args.device)
-            else:
-                state_dict = torch.load(os.path.join(self.state.best_model_checkpoint, WEIGHTS_NAME))
-                self.model.load_state_dict(state_dict)
+            self._load_best_model()
 
             if self.deepspeed:
                 self.deepspeed.load_checkpoint(
@@ -1229,6 +1581,56 @@ class Trainer:
         self._memory_tracker.stop_and_update_metrics(metrics)
 
         return TrainOutput(self.state.global_step, self._total_loss_scalar / self.state.global_step, metrics)
+
+    def _load_best_model(self):
+        """Load the selected checkpoint while preserving a frozen dynamic-LoRA backbone."""
+
+        if isinstance(self.model, PreTrainedModel):
+            dynamic_rank_pattern = get_dynamic_lora_rank_pattern(self.model)
+            non_dynamic_trainability = (
+                get_non_dynamic_parameter_trainability(self.model)
+                if dynamic_rank_pattern
+                else None
+            )
+            runtime_before = sum(
+                parameter.numel()
+                for parameter in self.model.parameters()
+                if parameter.requires_grad
+            )
+            full_before = sum(parameter.numel() for parameter in self.model.parameters())
+            self.model = self.model.from_pretrained(self.state.best_model_checkpoint)
+            loaded_rank_pattern = get_dynamic_lora_rank_pattern(self.model)
+            if loaded_rank_pattern and non_dynamic_trainability is not None:
+                # Older checkpoints do not contain this mask. The live training
+                # model is the authoritative fallback for load_best_model_at_end.
+                restore_non_dynamic_parameter_trainability(
+                    self.model,
+                    non_dynamic_trainability,
+                    checkpoint_path=self.state.best_model_checkpoint,
+                )
+            runtime_after = sum(
+                parameter.numel()
+                for parameter in self.model.parameters()
+                if parameter.requires_grad
+            )
+            full_after = sum(parameter.numel() for parameter in self.model.parameters())
+            if loaded_rank_pattern:
+                logger.info(
+                    "Dynamic best-checkpoint trainability restored checkpoint=%s "
+                    "runtime_trainable_before_reload=%s runtime_trainable_after_reload=%s "
+                    "full_model_before_reload=%s full_model_after_reload=%s",
+                    self.state.best_model_checkpoint,
+                    runtime_before,
+                    runtime_after,
+                    full_before,
+                    full_after,
+                )
+            if self.place_model_on_device:
+                self.model = self.model.to(self.args.device)
+            self._best_model_was_loaded = True
+        else:
+            state_dict = torch.load(os.path.join(self.state.best_model_checkpoint, WEIGHTS_NAME))
+            self.model.load_state_dict(state_dict)
 
     def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch):
         if self.control.should_log:
@@ -1281,6 +1683,14 @@ class Trainer:
             self.store_flos()
 
         output_dir = os.path.join(run_dir, checkpoint_folder)
+        if (
+            self.rankallocator is not None
+            and getattr(self.rankallocator, "rank_allocator", None)
+            == "genetic_budgeted_calibrated"
+        ):
+            self.rankallocator.capture_checkpoint_state(
+                self.model, self.optimizer, self.state.global_step
+            )
         self.save_model(output_dir)
         if self.deepspeed:
             self.deepspeed.save_checkpoint(output_dir)
@@ -1301,6 +1711,20 @@ class Trainer:
             with warnings.catch_warnings(record=True) as caught_warnings:
                 torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
             reissue_pt_warnings(caught_warnings)
+            if (
+                self.rankallocator is not None
+                and getattr(self.rankallocator, "rank_allocator", None)
+                == "genetic_budgeted_calibrated"
+            ):
+                torch.save(
+                    self._calibrated_rng_state_dict(),
+                    os.path.join(output_dir, "rng_state.pth"),
+                )
+                if self.use_amp:
+                    torch.save(
+                        self.scaler.state_dict(),
+                        os.path.join(output_dir, "scaler.pt"),
+                    )
 
         # Determine the new best metric / best model checkpoint
         if metrics is not None and self.args.metric_for_best_model is not None:
@@ -1627,11 +2051,27 @@ class Trainer:
 
         Will only save from the main process.
         """
+        if (
+            self.is_world_process_zero()
+            and self.rankallocator is not None
+            and getattr(self.rankallocator, "rank_allocator", None)
+            == "genetic_budgeted_calibrated"
+            and self.optimizer is not None
+            and not self._best_model_was_loaded
+        ):
+            self.rankallocator.capture_checkpoint_state(
+                self.model, self.optimizer, self.state.global_step
+            )
         if self.is_world_process_zero():
             model_to_save = unwrap_model(self.model)
             rank_pattern = get_dynamic_lora_rank_pattern(model_to_save)
             if rank_pattern:
                 setattr(model_to_save.config, DYNAMIC_LORA_RANK_PATTERN, rank_pattern)
+                setattr(
+                    model_to_save.config,
+                    DYNAMIC_LORA_NON_DYNAMIC_TRAINABILITY,
+                    get_non_dynamic_parameter_trainability(model_to_save),
+                )
                 active_ranks = [
                     int(metadata["active_rank"]) for metadata in rank_pattern.values()
                 ]
@@ -1750,12 +2190,71 @@ class Trainer:
         if self.args.save_total_limit is None or self.args.save_total_limit <= 0:
             return
 
+        if (
+            self.rankallocator is not None
+            and getattr(self.rankallocator, "rank_allocator", None)
+            == "genetic_budgeted_calibrated"
+        ):
+            # The historical sorter moves the best checkpoint to the final
+            # slot, which can make its generic deletion logic remove the true
+            # latest checkpoint. For exact resume, explicitly protect the
+            # union of {best, latest}; fill any remaining configured slots with
+            # the newest unprotected checkpoints.
+            def checkpoint_step(path):
+                match = re.match(
+                    r".*{}-([0-9]+)$".format(PREFIX_CHECKPOINT_DIR), str(path)
+                )
+                return int(match.group(1)) if match else -1
+
+            checkpoints = sorted(
+                (
+                    str(path)
+                    for path in Path(output_dir).glob(
+                        "{}-*".format(PREFIX_CHECKPOINT_DIR)
+                    )
+                ),
+                key=checkpoint_step,
+            )
+            latest = get_last_checkpoint(output_dir)
+            protected = {
+                str(Path(path))
+                for path in (self.state.best_model_checkpoint, latest)
+                if path is not None
+            }
+            protected.intersection_update(str(Path(path)) for path in checkpoints)
+            effective_limit = max(
+                int(self.args.save_total_limit), len(protected)
+            )
+            unprotected = [
+                checkpoint
+                for checkpoint in checkpoints
+                if str(Path(checkpoint)) not in protected
+            ]
+            extra_slots = max(0, effective_limit - len(protected))
+            retained_unprotected = set(
+                unprotected[-extra_slots:] if extra_slots else []
+            )
+            for checkpoint in checkpoints:
+                if (
+                    str(Path(checkpoint)) in protected
+                    or checkpoint in retained_unprotected
+                ):
+                    continue
+                logger.info(
+                    "Deleting older calibrated checkpoint [{}] while retaining "
+                    "the best and latest trajectory checkpoints".format(checkpoint)
+                )
+                shutil.rmtree(checkpoint)
+            return
+
         # Check if we should delete older checkpoint(s)
         checkpoints_sorted = self._sorted_checkpoints(use_mtime=use_mtime, output_dir=output_dir)
         if len(checkpoints_sorted) <= self.args.save_total_limit:
             return
 
-        number_of_checkpoints_to_delete = max(0, len(checkpoints_sorted) - self.args.save_total_limit)
+        number_of_checkpoints_to_delete = max(
+            0, len(checkpoints_sorted) - self.args.save_total_limit
+        )
         checkpoints_to_be_deleted = checkpoints_sorted[:number_of_checkpoints_to_delete]
         for checkpoint in checkpoints_to_be_deleted:
             logger.info("Deleting older checkpoint [{}] due to args.save_total_limit".format(checkpoint))

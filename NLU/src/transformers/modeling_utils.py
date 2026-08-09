@@ -47,8 +47,56 @@ from .utils import logging
 logger = logging.get_logger(__name__)
 
 DYNAMIC_LORA_RANK_PATTERN = "dynamic_lora_rank_pattern"
+DYNAMIC_LORA_NON_DYNAMIC_TRAINABILITY = "dynamic_lora_non_dynamic_trainability"
 _DYNAMIC_LORA_KEY = re.compile(r"(?:^|\.)(?:lora_[AEB]\.\d+|ranknum)$")
 _EXPANDED_DYNAMIC_LORA_KEY = re.compile(r"(?:^|\.)lora_[AEB]\.([1-9]\d*)$")
+
+
+def is_dynamic_lora_parameter_name(name):
+    return _DYNAMIC_LORA_KEY.search(name) is not None
+
+
+def get_non_dynamic_parameter_trainability(model):
+    """Capture the trainability mask that dynamic rank metadata does not cover."""
+
+    return {
+        name: bool(parameter.requires_grad)
+        for name, parameter in model.named_parameters()
+        if not is_dynamic_lora_parameter_name(name)
+    }
+
+
+def restore_non_dynamic_parameter_trainability(model, trainability, checkpoint_path=None):
+    """Restore frozen-backbone/task-head flags without overriding dynamic A/E/B flags."""
+
+    if not isinstance(trainability, dict):
+        raise ValueError("Non-dynamic parameter trainability metadata must be a dictionary.")
+    current = {
+        name: parameter
+        for name, parameter in model.named_parameters()
+        if not is_dynamic_lora_parameter_name(name)
+    }
+    expected_names = set(trainability)
+    current_names = set(current)
+    if expected_names != current_names:
+        missing = sorted(current_names.difference(expected_names))
+        unexpected = sorted(expected_names.difference(current_names))
+        raise RuntimeError(
+            "Non-dynamic trainability metadata does not match the model: "
+            "missing_parameters={} unknown_parameters={}.".format(
+                missing[:3], unexpected[:3]
+            )
+        )
+    for name, parameter in current.items():
+        parameter.requires_grad_(bool(trainability[name]))
+    logger.info(
+        "Restored non-dynamic parameter trainability checkpoint=%s parameters=%s "
+        "trainable=%s frozen=%s",
+        checkpoint_path,
+        len(current),
+        sum(bool(value) for value in trainability.values()),
+        sum(not bool(value) for value in trainability.values()),
+    )
 
 
 def get_dynamic_lora_rank_pattern(model):
@@ -1164,6 +1212,15 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin):
                 dynamic_lora_rank_pattern,
                 checkpoint_path=pretrained_model_name_or_path,
             )
+            non_dynamic_trainability = getattr(
+                config, DYNAMIC_LORA_NON_DYNAMIC_TRAINABILITY, None
+            )
+            if non_dynamic_trainability is not None:
+                restore_non_dynamic_parameter_trainability(
+                    model,
+                    non_dynamic_trainability,
+                    checkpoint_path=pretrained_model_name_or_path,
+                )
 
         if state_dict is None and not from_tf:
             try:
