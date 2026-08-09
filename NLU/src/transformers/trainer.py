@@ -1236,6 +1236,14 @@ class Trainer:
         self._load_optimizer_and_scheduler(resume_from_checkpoint)
         self._load_calibrated_scaler_state_file(resume_from_checkpoint)
         self._load_calibrated_rng_state_file(resume_from_checkpoint)
+        if (
+            self.rankallocator is not None
+            and getattr(self.rankallocator, "rank_allocator", None)
+            == "genetic_budgeted_calibrated"
+        ):
+            self.rankallocator.initialize_calibrated_reserves(
+                self.model, self.optimizer
+            )
 
         # important: at this point:
         # self.model         is the Transformers Model

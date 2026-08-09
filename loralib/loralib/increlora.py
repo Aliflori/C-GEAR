@@ -1245,6 +1245,61 @@ class RankAllocator(object):
         target_group = candidate_groups[0] if candidate_groups else optimizer.param_groups[0]
         target_group["params"].extend(new_parameters)
 
+    def initialize_calibrated_reserves(self, model, optimizer):
+        if self.rank_allocator != "genetic_budgeted_calibrated":
+            return 0
+        if self.allocation_stopped or self.total_rank >= self.target_rank:
+            return 0
+
+        new_parameters = []
+        initialized_components = 0
+        for name, module in model.named_modules():
+            if not isinstance(module, SVDLinear):
+                continue
+            metadata = module.get_dynamic_lora_metadata()
+            active_rank = int(metadata["active_rank"])
+            physical_capacity = int(metadata["rank_component_count"])
+            if active_rank > physical_capacity:
+                raise ValueError(
+                    "Calibrated active rank exceeds physical capacity for %s: "
+                    "active=%s capacity=%s."
+                    % (name, active_rank, physical_capacity)
+                )
+            required_capacity = active_rank + self.incre_rank_num
+            missing_capacity = max(0, required_capacity - physical_capacity)
+            if not missing_capacity:
+                continue
+            original_length = int(metadata["parameter_list_length"])
+            module.add_reserve_param(missing_capacity, self.advance_learn)
+            restored = module.get_dynamic_lora_metadata()
+            if int(restored["rank_component_count"]) < required_capacity:
+                raise RuntimeError(
+                    "Calibrated reserve initialization failed for %s: "
+                    "required=%s actual=%s."
+                    % (
+                        name,
+                        required_capacity,
+                        restored["rank_component_count"],
+                    )
+                )
+            new_parameters.extend(list(module.lora_A)[original_length:])
+            new_parameters.extend(list(module.lora_E)[original_length:])
+            new_parameters.extend(list(module.lora_B)[original_length:])
+            initialized_components += missing_capacity
+
+        self._add_calibrated_optimizer_parameters(optimizer, new_parameters)
+        if initialized_components:
+            self._save_budget_metadata(model)
+            logger.info(
+                "Initialized calibrated lazy reserves independently of gradient "
+                "finiteness rank_components=%s optimizer_parameters=%s "
+                "current_total_rank=%s",
+                initialized_components,
+                len(new_parameters),
+                self.total_rank,
+            )
+        return initialized_components
+
     def capture_checkpoint_state(self, model, optimizer, global_step):
         if self.rank_allocator != "genetic_budgeted_calibrated":
             return
@@ -2165,21 +2220,19 @@ class RankAllocator(object):
         increase_threshold=None
         add_r = self.incre_rank_num    
         # 为模型添加初始的储备参数
-        if global_step == 0:
+        if (
+            global_step == 0
+            and self.rank_allocator == "genetic_budgeted_calibrated"
+        ):
+            self.initialize_calibrated_reserves(model, optimizer)
+        elif global_step == 0:
             new_param_list = []
             for name, module in model.named_modules():
                     if isinstance(module, SVDLinear):
                         module.add_reserve_param(add_r, self.advance_learn)
                         new_param_list.extend(module.lora_A[ -add_r: ])
                         new_param_list.extend(module.lora_B[ -add_r: ])
-                        if self.rank_allocator == "genetic_budgeted_calibrated":
-                            # Register inactive E reserves up front so stateless
-                            # AdamW calibration can use the exact optimizer group.
-                            new_param_list.extend(module.lora_E[ -add_r: ])
-            if self.rank_allocator == "genetic_budgeted_calibrated":
-                self._add_calibrated_optimizer_parameters(optimizer, new_param_list)
-                self._save_budget_metadata(model)
-            elif self.advance_learn:
+            if self.advance_learn:
                 optimizer.add_param_group({'params': new_param_list, "weight_decay": self.weight_decay,})
 
         if self.rank_allocator == "genetic_budgeted_calibrated":

@@ -349,6 +349,50 @@ class LegacyAllocatorRegressionTest(unittest.TestCase):
 
 
 class CalibrationIsolationAndRestorationTest(unittest.TestCase):
+    def test_calibrated_reserves_initialize_before_gradient_finiteness(self):
+        model = TinyDynamicModel()
+        allocator = calibrated_allocator(model)
+        optimizer = AdamW(model.parameters(), lr=1e-3)
+        model.small.lora_A[0].grad = torch.full_like(
+            model.small.lora_A[0], float("nan")
+        )
+        active_ranks = {
+            name: int(module.ranknum.item())
+            for name, module in model.named_modules()
+            if isinstance(module, SVDLinear)
+        }
+
+        initialized = allocator.initialize_calibrated_reserves(model, optimizer)
+
+        self.assertEqual(initialized, 2)
+        optimizer_parameter_ids = {
+            id(parameter)
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        }
+        for name, module in model.named_modules():
+            if not isinstance(module, SVDLinear):
+                continue
+            metadata = module.get_dynamic_lora_metadata()
+            self.assertEqual(metadata["active_rank"], active_ranks[name])
+            self.assertEqual(metadata["rank_component_count"], active_ranks[name] + 1)
+            for parameter in (
+                module.lora_A[-1],
+                module.lora_E[-1],
+                module.lora_B[-1],
+            ):
+                self.assertIn(id(parameter), optimizer_parameter_ids)
+
+        candidate = virtual.get_candidate_rank_parameters(model.small, 1)
+        self.assertEqual(candidate["active_rank"], 1)
+        self.assertEqual(candidate["new_active_rank"], 2)
+
+        state_keys = tuple(model.state_dict().keys())
+        self.assertEqual(
+            allocator.initialize_calibrated_reserves(model, optimizer), 0
+        )
+        self.assertEqual(tuple(model.state_dict().keys()), state_keys)
+
     def test_c_calibration_batches_use_training_dataset_only(self):
         with tempfile.TemporaryDirectory() as directory:
             model = TinyDynamicModel()
