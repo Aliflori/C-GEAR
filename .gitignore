@@ -8,3 +8,13 @@
 *.bak
 /NLU/runs/
 /NLU/wandb/
+
+# Large model, optimizer, and TensorBoard artifacts
+**/pytorch_model.bin
+**/*.safetensors
+**/optimizer.pt
+**/scheduler.pt
+**/scaler.pt
+**/rng_state*.pth
+**/training_args.bin
+**/events.out.tfevents.*
