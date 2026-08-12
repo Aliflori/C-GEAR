@@ -1,0 +1,2 @@
+# Lightweight reporting dependency, separate from NLU training requirements.
+matplotlib==3.5.3
