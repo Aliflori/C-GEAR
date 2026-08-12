@@ -433,6 +433,15 @@ class TrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": "Matched Greedy best checkpoint used only for post-training parameter reporting."},
     )
+    rank_telemetry: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Append observational dynamic-rank events to "
+                "<root_output_dir>/telemetry.jsonl."
+            )
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()
@@ -569,7 +578,22 @@ def main():
                 f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
                 "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
             )
-    
+
+    # Private, non-serialized context for observational rank telemetry. The
+    # writer truncates for a fresh training run, appends when normal checkpoint
+    # discovery establishes a resume, and never destroys an existing stream
+    # during evaluation-only use of the same output root.
+    telemetry_path = os.path.join(training_args.root_output_dir, "telemetry.jsonl")
+    training_args._rank_telemetry_resume = (
+        last_checkpoint is not None
+        or (not training_args.do_train and os.path.isfile(telemetry_path))
+    )
+    training_args._rank_telemetry_metadata = {
+        "task": data_args.task_name,
+        "model_name_or_path": model_args.model_name_or_path,
+        "max_seq_length": data_args.max_seq_length,
+    }
+
 
     # Setup logging
     logging.basicConfig(
@@ -975,6 +999,7 @@ def main():
 
 
     budget_finalized = False
+    train_metrics = None
 
     # Training
     if training_args.do_train:
@@ -989,6 +1014,7 @@ def main():
 
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         metrics = train_result.metrics
+        train_metrics = dict(metrics)
         max_train_samples = (
             data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
         )
@@ -1097,6 +1123,8 @@ def main():
                 "Calibrated matched parameter report=%s",
                 parameter_report,
             )
+
+    trainer.emit_rank_telemetry_run_end(train_metrics=train_metrics)
 
 
 def _mp_fn(index):

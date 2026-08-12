@@ -347,6 +347,9 @@ class Trainer:
         self._rank_calibration_batch_pairs = None
         self._calibrated_resume_rng_state = None
         self._best_model_was_loaded = False
+        self._rank_telemetry_writer = None
+        self._rank_telemetry_started = False
+        self._rank_telemetry_run_ended = False
 
         # postpone switching model to cuda when:
         # 1. MP - since we are trying to fit a much bigger than 1 gpu model
@@ -383,6 +386,7 @@ class Trainer:
         # Create output directory if needed
         if self.is_world_process_zero():
             os.makedirs(self.args.output_dir, exist_ok=True)
+        self._initialize_rank_telemetry()
         if not callable(self.data_collator) and callable(getattr(self.data_collator, "collate_batch", None)):
             raise ValueError("The `data_collator` should be a simple callable (function, class with `__call__`).")
 
@@ -678,6 +682,294 @@ class Trainer:
                 self._past = saved_past
             elif hasattr(self, "_past"):
                 delattr(self, "_past")
+
+    def _initialize_rank_telemetry(self):
+        """Create the main-process observational JSONL sink when requested."""
+
+        if not bool(getattr(self.args, "rank_telemetry", False)):
+            return
+        if not self.is_world_process_zero():
+            return
+        from .rank_telemetry import JsonlTelemetryWriter
+
+        root_output_dir = getattr(self.args, "root_output_dir", None)
+        if not root_output_dir:
+            root_output_dir = os.path.dirname(os.path.abspath(self.args.output_dir))
+        path = os.path.join(root_output_dir, "telemetry.jsonl")
+        self._rank_telemetry_writer = JsonlTelemetryWriter(
+            path=path,
+            enabled=True,
+            base_fields={
+                "seed": int(self.args.seed),
+                "method": (
+                    getattr(self.rankallocator, "rank_allocator", None)
+                    if self.rankallocator is not None
+                    else "none"
+                ),
+            },
+            append=bool(getattr(self.args, "_rank_telemetry_resume", False)),
+            failure_policy="disable",
+            nonfinite_policy="string",
+        )
+        if self.rankallocator is not None:
+            self.rankallocator.set_rank_telemetry_writer(self._rank_telemetry_writer)
+        logger.info("Rank telemetry enabled path=%s", path)
+
+    def _rank_telemetry_snapshot(self):
+        writer = self._rank_telemetry_writer
+        if writer is None or not writer.enabled:
+            return None
+        try:
+            from .rank_telemetry import snapshot_rank_state
+
+            return snapshot_rank_state(self.model)
+        except Exception as error:
+            logger.warning("Rank telemetry snapshot failed and was omitted: %s", error)
+            return None
+
+    def _emit_rank_telemetry(self, event_type, global_step=None, **fields):
+        writer = self._rank_telemetry_writer
+        if writer is None or not writer.enabled:
+            return False
+        step = self.state.global_step if global_step is None else global_step
+        try:
+            return bool(writer.emit(event_type, int(step), **fields))
+        except Exception as error:
+            logger.warning("Rank telemetry event '%s' was not written: %s", event_type, error)
+            return False
+
+    @staticmethod
+    def _rank_telemetry_optional_software_hardware():
+        metadata = {
+            "torch_version": torch.__version__,
+            "cuda_available": False,
+            "cuda_version": getattr(torch.version, "cuda", None),
+            "gpu_name": None,
+            "transformers_version": None,
+        }
+        try:
+            from . import __version__ as transformers_version
+
+            metadata["transformers_version"] = transformers_version
+        except Exception:
+            pass
+        try:
+            metadata["cuda_available"] = bool(torch.cuda.is_available())
+            if metadata["cuda_available"]:
+                metadata["gpu_name"] = torch.cuda.get_device_name(torch.cuda.current_device())
+        except Exception:
+            pass
+        return metadata
+
+    def _emit_rank_telemetry_run_start(self, max_steps=None, resume_from_checkpoint=None):
+        if self._rank_telemetry_started or self._rank_telemetry_writer is None:
+            return
+        allocator = self.rankallocator
+        context = dict(getattr(self.args, "_rank_telemetry_metadata", {}) or {})
+        model_args = self.model_args
+        allocator_fields = {}
+        if allocator is not None:
+            for field in (
+                "top_h",
+                "incre_interval",
+                "init_warmup",
+                "incre_rank_num",
+                "ga_population",
+                "ga_generations",
+                "ga_mutation_rate",
+                "ga_crossover_rate",
+                "ga_interaction_weight",
+                "ga_redundancy_weight",
+                "ga_cost_weight",
+                "ga_diversity_weight",
+                "ga_local_search",
+                "ga_gain_tolerance",
+                "ga_budget_ratio",
+                "ga_allow_variable_event_rank",
+                "target_final_trainable_params",
+                "ga_max_greedy_replacements",
+                "ga_calibration_batches",
+                "ga_calibration_batch_size",
+                "ga_calibration_seed_offset",
+                "ga_calibration_topk",
+                "ga_calibration_lcb_beta",
+                "ga_quality_absolute_tolerance",
+                "ga_quality_relative_tolerance",
+                "ga_greedy_quality_floor_ratio",
+                "ga_greedy_quality_floor_absolute",
+                "ga_min_calibrated_marginal_gain",
+                "ga_allocation_stop_patience",
+                "ga_min_event_rank",
+                "ga_max_event_rank",
+                "ga_min_consolidation_steps",
+                "ga_new_rank_lr_warmup_steps",
+                "lora_init_rank",
+                "ave_target_rank",
+                "target_rank",
+                "advance_learn",
+                "beta1",
+                "beta2",
+                "training_seed",
+            ):
+                allocator_fields[field] = getattr(allocator, field, None)
+        scheduler_type = getattr(self.args, "lr_scheduler_type", None)
+        if hasattr(scheduler_type, "value"):
+            scheduler_type = scheduler_type.value
+        evaluation_strategy = getattr(self.args, "evaluation_strategy", None)
+        if hasattr(evaluation_strategy, "value"):
+            evaluation_strategy = evaluation_strategy.value
+        save_strategy = getattr(self.args, "save_strategy", None)
+        if hasattr(save_strategy, "value"):
+            save_strategy = save_strategy.value
+        snapshot = self._rank_telemetry_snapshot() or {}
+        emitted = self._emit_rank_telemetry(
+            "run_start",
+            global_step=self.state.global_step,
+            resumed=resume_from_checkpoint is not None,
+            resume_from_checkpoint=resume_from_checkpoint,
+            experiment_name=getattr(self.args, "experiment_name", None),
+            root_output_dir=getattr(self.args, "root_output_dir", None),
+            task=context.get("task"),
+            model_name_or_path=context.get("model_name_or_path"),
+            max_seq_length=context.get("max_seq_length"),
+            lora_configuration={
+                field: getattr(model_args, field, None) if model_args is not None else None
+                for field in (
+                    "lora_type",
+                    "lora_alpha",
+                    "lora_dropout",
+                    "lora_module",
+                    "reg_orth_coef",
+                    "reg_loss_wgt",
+                    "masking_prob",
+                )
+            },
+            learning_rate=self.args.learning_rate,
+            optimizer=("adafactor" if self.args.adafactor else "adamw"),
+            adam_beta1=self.args.adam_beta1,
+            adam_beta2=self.args.adam_beta2,
+            adam_epsilon=self.args.adam_epsilon,
+            max_grad_norm=self.args.max_grad_norm,
+            num_train_epochs=self.args.num_train_epochs,
+            total_optimization_steps=max_steps,
+            train_batch_size=self.args.train_batch_size,
+            per_device_train_batch_size=self.args.per_device_train_batch_size,
+            eval_batch_size=self.args.eval_batch_size,
+            per_device_eval_batch_size=self.args.per_device_eval_batch_size,
+            gradient_accumulation_steps=self.args.gradient_accumulation_steps,
+            fp16=self.args.fp16,
+            bf16=getattr(self.args, "bf16", False),
+            save_steps=self.args.save_steps,
+            eval_steps=self.args.eval_steps,
+            save_strategy=str(save_strategy),
+            evaluation_strategy=str(evaluation_strategy),
+            warmup_steps=self.args.warmup_steps,
+            warmup_ratio=self.args.warmup_ratio,
+            weight_decay=self.args.weight_decay,
+            scheduler_type=str(scheduler_type),
+            metric_for_best_model=self.args.metric_for_best_model,
+            allocator_type=(
+                getattr(allocator, "rank_allocator", None) if allocator is not None else None
+            ),
+            allocator_configuration=allocator_fields,
+            software_hardware=self._rank_telemetry_optional_software_hardware(),
+            **snapshot,
+        )
+        self._rank_telemetry_started = bool(emitted)
+
+    def emit_rank_telemetry_run_end(self, train_metrics=None):
+        """Emit the normal-completion summary and close the flushed JSONL sink."""
+
+        writer = self._rank_telemetry_writer
+        if writer is None or self._rank_telemetry_run_ended:
+            return
+        self._emit_rank_telemetry_run_start(
+            max_steps=getattr(self.state, "max_steps", None),
+            resume_from_checkpoint=None,
+        )
+        snapshot = self._rank_telemetry_snapshot() or {}
+        allocator = self.rankallocator
+        final_trajectory = (
+            getattr(allocator, "final_trajectory_metrics", None)
+            if allocator is not None
+            else None
+        )
+        telemetry_final = (
+            getattr(allocator, "rank_telemetry_final_trajectory_snapshot", None)
+            if allocator is not None
+            else None
+        )
+        if not isinstance(final_trajectory, dict):
+            final_trajectory = telemetry_final if isinstance(telemetry_final, dict) else snapshot
+        final_rank_map = final_trajectory.get(
+            "rank_pattern", final_trajectory.get("module_active_ranks")
+        )
+        if final_rank_map is None and isinstance(telemetry_final, dict):
+            final_rank_map = telemetry_final.get("module_active_ranks")
+        runtime = (train_metrics or {}).get("train_runtime")
+        metric_name = str(self.args.metric_for_best_model or "")
+        best_accuracy = (
+            self.state.best_metric if "accuracy" in metric_name.lower() else None
+        )
+        self._emit_rank_telemetry(
+            "run_end",
+            global_step=self.state.global_step,
+            status="completed",
+            runtime_seconds=runtime,
+            best_accuracy=best_accuracy,
+            best_metric=self.state.best_metric,
+            best_checkpoint=self.state.best_model_checkpoint,
+            selected_active_rank=snapshot.get("total_active_rank"),
+            selected_active_parameter_count=snapshot.get(
+                "active_model_parameter_count"
+            ),
+            selected_runtime_trainable_parameter_count=snapshot.get(
+                "runtime_trainable_parameter_count"
+            ),
+            selected_full_model_parameter_count=snapshot.get(
+                "full_model_parameter_count"
+            ),
+            selected_physical_rank_component_count=snapshot.get(
+                "physical_rank_component_count"
+            ),
+            selected_module_active_ranks=snapshot.get("module_active_ranks"),
+            final_active_rank=(
+                final_trajectory.get("total_active_rank")
+            ),
+            final_active_parameter_count=(
+                final_trajectory.get("active_model_parameter_count")
+            ),
+            final_runtime_trainable_parameter_count=(
+                final_trajectory.get("runtime_trainable_parameter_count")
+            ),
+            final_full_model_parameter_count=(
+                final_trajectory.get("full_model_parameter_count")
+            ),
+            final_physical_rank_component_count=(
+                telemetry_final.get("physical_rank_component_count")
+                if isinstance(telemetry_final, dict)
+                else final_trajectory.get("physical_rank_component_count")
+            ),
+            final_module_active_ranks=final_rank_map,
+            allocator_stop_step=(
+                getattr(allocator, "allocation_stopped_step", None)
+                if allocator is not None
+                else None
+            ),
+            allocator_stop_reason=(
+                getattr(allocator, "allocation_stop_reason", None)
+                if allocator is not None
+                else None
+            ),
+            **snapshot,
+        )
+        self._rank_telemetry_run_ended = True
+        try:
+            writer.close()
+        except Exception as error:
+            writer.last_error = error
+            writer.enabled = False
+            logger.warning("Rank telemetry failed while closing: %s", error)
 
     def _calibrated_rng_state_dict(self):
         return {
@@ -1320,6 +1612,10 @@ class Trainer:
         self._total_flos = self.state.total_flos
         model.zero_grad()
 
+        self._emit_rank_telemetry_run_start(
+            max_steps=max_steps,
+            resume_from_checkpoint=resume_from_checkpoint,
+        )
         self.control = self.callback_handler.on_train_begin(self.args, self.state, self.control)
 
         # Skip the first epochs_trained epochs to get the random state of the dataloader at the right point.
@@ -1462,10 +1758,35 @@ class Trainer:
                                 )
                             else:
                                 curr_rank, incre_threshold = 0, None
+                                scheduled_allocation_due = bool(
+                                    self.state.global_step
+                                    > self.rankallocator.init_warmup
+                                    and self.state.global_step
+                                    % self.rankallocator.incre_interval
+                                    == 0
+                                    and self.rankallocator.total_rank
+                                    < self.rankallocator.target_rank
+                                    and not self.rankallocator.allocation_stopped
+                                )
                                 logger.warning(
                                     "Skipped calibrated allocator update at global_step=%s "
                                     "because unscaled training gradients are non-finite.",
                                     self.state.global_step,
+                                )
+                                self._emit_rank_telemetry(
+                                    "warning",
+                                    global_step=self.state.global_step,
+                                    warning_type="non_finite_unscaled_training_gradients",
+                                    message=(
+                                        "Skipped calibrated allocator update because "
+                                        "unscaled training gradients are non-finite."
+                                    ),
+                                    scheduled_allocation_due=scheduled_allocation_due,
+                                    allocation_event_consumed=False,
+                                    allocator_update_executed=False,
+                                    scheduled_allocation_slot_skipped=(
+                                        scheduled_allocation_due
+                                    ),
                                 )
                             self.rankallocator.snapshot_new_rank_warmup_parameters(
                                 self.model
@@ -1753,6 +2074,22 @@ class Trainer:
         # Save the Trainer state
         if self.is_world_process_zero():
             self.state.save_to_json(os.path.join(output_dir, "trainer_state.json"))
+            snapshot = self._rank_telemetry_snapshot()
+            if snapshot is not None:
+                self._emit_rank_telemetry(
+                    "checkpoint_save",
+                    global_step=self.state.global_step,
+                    checkpoint_path=output_dir,
+                    is_best_checkpoint=(
+                        self.state.best_model_checkpoint is not None
+                        and os.path.abspath(self.state.best_model_checkpoint)
+                        == os.path.abspath(output_dir)
+                    ),
+                    best_metric_so_far=self.state.best_metric,
+                    best_checkpoint_so_far=self.state.best_model_checkpoint,
+                    metrics=metrics,
+                    **snapshot,
+                )
 
         # Maybe delete some older checkpoints.
         if self.is_world_process_zero():
@@ -2328,6 +2665,49 @@ class Trainer:
         self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, output.metrics)
 
         self._memory_tracker.stop_and_update_metrics(output.metrics)
+
+        self._emit_rank_telemetry_run_start(
+            max_steps=getattr(self.state, "max_steps", None),
+            resume_from_checkpoint=None,
+        )
+        snapshot = self._rank_telemetry_snapshot()
+        if snapshot is not None:
+            if self._best_model_was_loaded:
+                evaluation_role = "selected_best_checkpoint_evaluation"
+                evaluated_checkpoint = self.state.best_model_checkpoint
+            elif self.is_in_train or self.state.global_step > 0:
+                evaluation_role = "training_trajectory_evaluation"
+                evaluated_checkpoint = None
+            else:
+                evaluation_role = "standalone_evaluation"
+                evaluated_checkpoint = getattr(
+                    self.model_args, "model_name_or_path", None
+                )
+            self._emit_rank_telemetry(
+                "evaluation",
+                global_step=self.state.global_step,
+            accuracy=output.metrics.get("%s_accuracy" % metric_key_prefix),
+            loss=output.metrics.get("%s_loss" % metric_key_prefix),
+            metrics=output.metrics,
+                state_role=evaluation_role,
+                evaluated_checkpoint=evaluated_checkpoint,
+                current_total_active_rank=snapshot["total_active_rank"],
+                current_active_parameter_count=snapshot[
+                    "active_model_parameter_count"
+                ],
+                best_metric_so_far=self.state.best_metric,
+                best_checkpoint_so_far=self.state.best_model_checkpoint,
+            best_state_phase=(
+                    "selected_best_checkpoint_loaded"
+                    if self._best_model_was_loaded
+                    else (
+                        "standalone_evaluation"
+                        if evaluation_role == "standalone_evaluation"
+                        else "before_current_checkpoint_selection"
+                    )
+            ),
+                **snapshot,
+            )
 
         return output.metrics
 

@@ -109,6 +109,7 @@ examples/text-classification/run_glue.py \
 --tb_writter_loginterval 50 \
 --seed "${seed}" \
 --rank_allocator "${allocator}" \
+--rank_telemetry true \
 --ga_population 12 \
 --ga_generations 4 \
 --ga_mutation_rate 0.10 \

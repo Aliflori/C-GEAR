@@ -752,6 +752,7 @@ class RankAllocator(object):
         self.zero_rank_event_counter = 0
         self.allocation_stopped = False
         self.allocation_stopped_step = None
+        self.allocation_stop_reason = None
         self.consolidation_started_step = None
         self.consolidation_remaining_steps = None
         self.new_rank_warmup_state = {}
@@ -760,6 +761,8 @@ class RankAllocator(object):
         self.training_configuration = None
         self._checkpoint_total_step = None
         self._loaded_calibrated_metadata = None
+        self.rank_telemetry_writer = None
+        self.rank_telemetry_final_trajectory_snapshot = None
         if self.rank_allocator in ("genetic_budgeted", "genetic_budgeted_calibrated"):
             self._initialize_hard_budget(model)
 
@@ -1000,6 +1003,7 @@ class RankAllocator(object):
         self.zero_rank_event_counter = int(loaded_metadata.get("zero_rank_event_counter", 0))
         self.allocation_stopped = bool(loaded_metadata.get("allocation_stopped", False))
         self.allocation_stopped_step = loaded_metadata.get("allocation_stopped_step")
+        self.allocation_stop_reason = loaded_metadata.get("allocation_stop_reason")
         self.consolidation_started_step = loaded_metadata.get("consolidation_started_step")
         self.consolidation_remaining_steps = loaded_metadata.get("consolidation_remaining_steps")
         self._checkpoint_total_step = loaded_metadata.get("total_optimization_steps")
@@ -1065,6 +1069,7 @@ class RankAllocator(object):
                 "zero_rank_event_counter": self.zero_rank_event_counter,
                 "allocation_stopped": self.allocation_stopped,
                 "allocation_stopped_step": self.allocation_stopped_step,
+                "allocation_stop_reason": self.allocation_stop_reason,
                 "consolidation_started_step": self.consolidation_started_step,
                 "consolidation_remaining_steps": self.consolidation_remaining_steps,
                 "active_rank_pattern": active_rank_pattern,
@@ -1451,16 +1456,34 @@ class RankAllocator(object):
                     hook.remove()
                     module.hook_handle = None
 
-    def _start_consolidation(self, model, global_step, reason):
+    def _emit_allocator_stop_telemetry(self, model, global_step):
+        snapshot = self._rank_telemetry_snapshot(model)
+        if snapshot is None:
+            return
+        self.rank_telemetry_final_trajectory_snapshot = dict(snapshot)
+        self._emit_rank_telemetry(
+            "allocator_stop",
+            global_step,
+            stop_reason=self.allocation_stop_reason,
+            zero_rank_patience=self.zero_rank_event_counter,
+            minimum_consolidation_remaining=self.consolidation_remaining_steps,
+            allocation_stopped=True,
+            **snapshot,
+        )
+
+    def _start_consolidation(self, model, global_step, reason, emit_telemetry=True):
         if self.rank_allocator != "genetic_budgeted_calibrated" or self.allocation_stopped:
             return
         self.allocation_stopped = True
         self.allocation_stopped_step = int(global_step)
+        self.allocation_stop_reason = str(reason)
         self.consolidation_started_step = int(global_step)
         self.consolidation_remaining_steps = max(0, int(self.total_step) - int(global_step))
         self._freeze_consolidation_reserves(model)
         self.record_final_trajectory(model, global_step=global_step)
         self._save_budget_metadata(model)
+        if emit_telemetry:
+            self._emit_allocator_stop_telemetry(model, global_step)
         logger.info(
             "Calibrated consolidation started reason=%s consolidation_started_step=%s "
             "consolidation_remaining_steps=%s fixed_total_active_rank=%s "
@@ -1481,8 +1504,16 @@ class RankAllocator(object):
             if isinstance(module, SVDLinear)
         }
         total_active_rank = int(sum(trajectory_rank_pattern.values()))
+        physical_rank_component_count = int(
+            sum(
+                int(module.get_dynamic_lora_metadata()["rank_component_count"])
+                for module in model.modules()
+                if isinstance(module, SVDLinear)
+            )
+        )
         self.final_trajectory_metrics = {
             "total_active_rank": total_active_rank,
+            "physical_rank_component_count": physical_rank_component_count,
             "active_model_parameter_count": get_active_model_parameter_count(model),
             "runtime_trainable_parameter_count": get_runtime_trainable_parameter_count(model),
             "full_model_parameter_count": get_full_model_parameter_count(model),
@@ -1491,6 +1522,7 @@ class RankAllocator(object):
             ),
             "allocation_stopped": self.allocation_stopped,
             "allocation_stopped_step": self.allocation_stopped_step,
+            "allocation_stop_reason": self.allocation_stop_reason,
             "consolidation_started_step": self.consolidation_started_step,
             "consolidation_remaining_steps": self.consolidation_remaining_steps,
             "rank_pattern": trajectory_rank_pattern,
@@ -1595,6 +1627,46 @@ class RankAllocator(object):
     def _format_diagnostic_float(value):
         return "none" if value is None else "%.6f" % value
 
+    def set_rank_telemetry_writer(self, writer):
+        """Attach an observational writer without changing allocator state."""
+
+        self.rank_telemetry_writer = writer
+
+    def _rank_telemetry_enabled(self):
+        return bool(
+            self.rank_telemetry_writer is not None
+            and getattr(self.rank_telemetry_writer, "enabled", False)
+        )
+
+    def _rank_telemetry_snapshot(self, model):
+        if not self._rank_telemetry_enabled():
+            return None
+        try:
+            from transformers.rank_telemetry import snapshot_rank_state
+
+            return snapshot_rank_state(model)
+        except Exception as error:
+            logger.warning("Rank telemetry snapshot failed and was omitted: %s", error)
+            return None
+
+    def _emit_rank_telemetry(self, event_type, global_step, **fields):
+        if not self._rank_telemetry_enabled():
+            return False
+        try:
+            return bool(
+                self.rank_telemetry_writer.emit(
+                    event_type,
+                    int(global_step),
+                    **fields,
+                )
+            )
+        except Exception as error:
+            # The writer normally isolates individual write failures itself.
+            # This final guard keeps optional observation outside allocator
+            # control flow even for an unexpected telemetry implementation.
+            logger.warning("Rank telemetry event '%s' was not written: %s", event_type, error)
+            return False
+
     @staticmethod
     def _rank_one_parameter_cost(layer):
         # add_reserve_param creates A(1, in), E(1, 1), and B(out, 1).
@@ -1638,6 +1710,7 @@ class RankAllocator(object):
             self._start_consolidation(model, self.global_step, "maximum_rank_reached")
             return increase_threshold
 
+        pre_snapshot = self._rank_telemetry_snapshot(model)
         ga_started = time.perf_counter()
         candidate_names = list(is_dict)
         module_costs = {
@@ -1774,11 +1847,112 @@ class RankAllocator(object):
         selected_event_rank = len(selected_modules)
         self.last_selected_event_rank = selected_event_rank
 
+        selected_candidate_id = None
+        if self._rank_telemetry_enabled():
+            candidate_ids = {
+                tuple(candidate.get("chromosome", ())): "candidate_%03d" % index
+                for index, candidate in enumerate(selection_diagnostics["candidates"])
+            }
+            selected_candidate_id = candidate_ids.get(
+                tuple(selected.get("chromosome", ()))
+            )
+            candidate_records = []
+            for candidate in selection_diagnostics["candidates"]:
+                candidate_records.append(
+                    {
+                        "candidate_id": candidate_ids.get(tuple(candidate.get("chromosome", ()))),
+                        "candidate_source": candidate.get("candidate_family"),
+                        "candidate_sources": candidate.get("candidate_families", []),
+                        "shortlist_reasons": candidate.get("shortlist_reasons", []),
+                        "k": int(candidate.get("chromosome_size", 0)),
+                        "modules": candidate.get("modules", []),
+                        "parameter_cost": candidate.get("actual_cost"),
+                        "projected_active_parameter_count": candidate.get(
+                            "projected_final_active_parameter_count"
+                        ),
+                        "fold_scores": candidate.get("fold_gains", []),
+                        "fold_details": candidate.get("fold_details", []),
+                        "mean_score": candidate.get("calibration_gain_mean"),
+                        "std_score": candidate.get("calibration_gain_std"),
+                        "lcb_score": candidate.get("calibration_gain_lcb"),
+                        "calibration_gain_per_parameter": candidate.get(
+                            "calibration_gain_per_parameter"
+                        ),
+                        "calibration_valid": bool(candidate.get("calibration_valid", False)),
+                        "invalid_reason": candidate.get("calibration_invalid_reason"),
+                        "budget_feasible": bool(candidate.get("budget_feasible", False)),
+                        "structural_fitness": candidate.get("structural_fitness"),
+                        "optimizer_raw_gain": candidate.get("optimizer_raw_gain"),
+                        "hamming_distance_from_greedy": candidate.get(
+                            "hamming_distance_from_greedy"
+                        ),
+                        "greedy_quality_floor_satisfied": candidate.get(
+                            "greedy_quality_floor_satisfied"
+                        ),
+                        "global_quality_requirement_satisfied": candidate.get(
+                            "global_quality_requirement_satisfied"
+                        ),
+                        "quality_band_satisfied": candidate.get(
+                            "quality_band_satisfied"
+                        ),
+                    }
+                )
+            self._emit_rank_telemetry(
+                "calibration_event",
+                self.global_step,
+                selected_candidate_id=selected_candidate_id,
+                candidates=candidate_records,
+                budget_blocked_candidate_count=sum(
+                    not bool(candidate.get("budget_feasible", False))
+                    for candidate in candidates
+                ),
+                invalid_calibration_candidate_count=sum(
+                    not bool(candidate.get("calibration_valid", False))
+                    for candidate in selection_diagnostics["candidates"]
+                ),
+                ga_runtime_seconds=ga_runtime,
+                calibration_runtime_seconds=total_calibration_runtime,
+                generation_diagnostics=generation_diagnostics,
+                shortlist_diagnostics=shortlist_diagnostics,
+                selection_summary={
+                    key: selection_diagnostics.get(key)
+                    for key in (
+                        "selected_source",
+                        "selected_event_rank",
+                        "zero_rank_selected",
+                        "zero_rank_reason",
+                        "greedy_quality_floor_threshold",
+                        "global_quality_improvement_threshold",
+                        "best_calibration_gain_lcb",
+                        "quality_band_threshold",
+                        "finite_budget_feasible_candidate_count",
+                        "eligible_positive_candidate_count",
+                        "quality_set_candidate_count",
+                    )
+                },
+            )
+            self._emit_rank_telemetry(
+                "candidate_selection",
+                self.global_step,
+                selected_candidate_id=selected_candidate_id,
+                selected_k=selected_event_rank,
+                selected_modules=selected_modules,
+                selected_source=selection_diagnostics["selected_source"],
+                zero_rank_reason=selection_diagnostics.get("zero_rank_reason"),
+                budget_limit=self.target_final_trainable_params,
+                projected_active_parameter_count=selected.get(
+                    "projected_final_active_parameter_count"
+                ),
+            )
+
         if selected_event_rank == 0:
             self.zero_rank_event_counter += 1
             if self.zero_rank_event_counter >= self.ga_allocation_stop_patience:
                 self._start_consolidation(
-                    model, self.global_step, "zero_rank_patience_exhausted"
+                    model,
+                    self.global_step,
+                    "zero_rank_patience_exhausted",
+                    emit_telemetry=False,
                 )
         else:
             self.zero_rank_event_counter = 0
@@ -1823,12 +1997,58 @@ class RankAllocator(object):
                     % (current_active_cost, self.target_final_trainable_params)
                 )
             if self.total_rank >= self.target_rank:
-                self._start_consolidation(model, self.global_step, "maximum_rank_reached")
+                self._start_consolidation(
+                    model,
+                    self.global_step,
+                    "maximum_rank_reached",
+                    emit_telemetry=False,
+                )
 
         for name, module in model.named_modules():
             if isinstance(module, SVDLinear):
                 self.rank_pattern[name] = int(round(float(module.ranknum.item())))
         self._save_budget_metadata(model)
+
+        post_snapshot = self._rank_telemetry_snapshot(model)
+        if post_snapshot is not None:
+            self.rank_telemetry_final_trajectory_snapshot = dict(post_snapshot)
+            pre_snapshot = pre_snapshot or post_snapshot
+            post_active = post_snapshot["active_model_parameter_count"]
+            self._emit_rank_telemetry(
+                "allocation_event",
+                self.global_step,
+                pre_total_active_rank=pre_snapshot["total_active_rank"],
+                post_total_active_rank=post_snapshot["total_active_rank"],
+                pre_active_parameter_count=pre_snapshot[
+                    "active_model_parameter_count"
+                ],
+                post_active_parameter_count=post_active,
+                selected_k=selected_event_rank,
+                selected_event_rank=selected_event_rank * self.incre_rank_num,
+                selected_candidate_id=selected_candidate_id,
+                selected_modules=selected_modules,
+                selected_source=selection_diagnostics["selected_source"],
+                rank_increments={
+                    name: self.incre_rank_num for name in selected_modules
+                },
+                budget_limit=self.target_final_trainable_params,
+                budget_used=post_active,
+                budget_remaining=self.target_final_trainable_params - post_active,
+                zero_rank_patience=self.zero_rank_event_counter,
+                allocation_stopped=self.allocation_stopped,
+                stop_reason=self.allocation_stop_reason,
+                zero_rank_reason=selection_diagnostics.get("zero_rank_reason"),
+                module_active_ranks_after=post_snapshot["module_active_ranks"],
+                **post_snapshot,
+            )
+        if (
+            self.allocation_stopped
+            and self.allocation_stopped_step == self.global_step
+        ):
+            # Consolidation/freezing has already happened at the original
+            # scientific control-flow point. Only its observational record is
+            # deferred so the triggering allocation is serialized first.
+            self._emit_allocator_stop_telemetry(model, self.global_step)
 
         selected_after_annotation = selection_diagnostics["selected_candidate"]
         logger.info(
@@ -1873,6 +2093,7 @@ class RankAllocator(object):
         return increase_threshold
 
     def increase_to_target_rank(self, model, optimizer): 
+        pre_snapshot = self._rank_telemetry_snapshot(model)
         is_dict = {}
         all_is = []
         module_layers = {}
@@ -2202,6 +2423,54 @@ class RankAllocator(object):
                 self.tb_writter.add_scalar("Budget/increase_threshold", increase_threshold, self.global_step)
                 self.tb_writter.add_scalar("Budget/sum_param", sum_param, self.global_step)
 
+        post_snapshot = self._rank_telemetry_snapshot(model)
+        if post_snapshot is not None:
+            self.rank_telemetry_final_trajectory_snapshot = dict(post_snapshot)
+            pre_snapshot = pre_snapshot or post_snapshot
+            selected_source = "greedy_importance"
+            if self.rank_allocator in ("genetic", "genetic_budgeted"):
+                selected_source = diagnostics.get("selected_source", self.rank_allocator)
+            budget_limit = (
+                self.target_final_trainable_params
+                if self.rank_allocator == "genetic_budgeted"
+                else None
+            )
+            post_active = post_snapshot["active_model_parameter_count"]
+            self._emit_rank_telemetry(
+                "allocation_event",
+                self.global_step,
+                pre_total_active_rank=pre_snapshot["total_active_rank"],
+                post_total_active_rank=post_snapshot["total_active_rank"],
+                pre_active_parameter_count=pre_snapshot[
+                    "active_model_parameter_count"
+                ],
+                post_active_parameter_count=post_active,
+                selected_k=len(selected_modules),
+                selected_event_rank=len(selected_modules) * self.incre_rank_num,
+                selected_candidate_id=None,
+                allocated_modules=list(selected_modules),
+                selected_modules=list(selected_modules),
+                selected_source=selected_source,
+                rank_increments={
+                    name: self.incre_rank_num for name in selected_modules
+                },
+                selected_module_scores={
+                    name: self._scalar_value(is_dict[name])
+                    for name in selected_modules
+                },
+                increase_threshold=increase_threshold,
+                top_h=self.top_h,
+                requested_k=k,
+                budget_limit=budget_limit,
+                budget_used=post_active if budget_limit is not None else None,
+                budget_remaining=(
+                    budget_limit - post_active if budget_limit is not None else None
+                ),
+                allocation_stopped=False,
+                module_active_ranks_after=post_snapshot["module_active_ranks"],
+                **post_snapshot,
+            )
+
         return increase_threshold
 
 
@@ -2252,6 +2521,37 @@ class RankAllocator(object):
                         self.total_rank,
                         get_active_model_parameter_count(model),
                     )
+                    snapshot = self._rank_telemetry_snapshot(model)
+                    if snapshot is not None:
+                        active_count = snapshot["active_model_parameter_count"]
+                        self.rank_telemetry_final_trajectory_snapshot = dict(snapshot)
+                        self._emit_rank_telemetry(
+                            "allocation_event",
+                            global_step,
+                            pre_total_active_rank=snapshot["total_active_rank"],
+                            post_total_active_rank=snapshot["total_active_rank"],
+                            pre_active_parameter_count=active_count,
+                            post_active_parameter_count=active_count,
+                            selected_k=0,
+                            selected_event_rank=0,
+                            selected_candidate_id=None,
+                            selected_modules=[],
+                            selected_source="allocation_stopped_consolidation",
+                            rank_increments={},
+                            budget_limit=self.target_final_trainable_params,
+                            budget_used=active_count,
+                            budget_remaining=(
+                                self.target_final_trainable_params - active_count
+                            ),
+                            zero_rank_patience=self.zero_rank_event_counter,
+                            allocation_stopped=True,
+                            stop_reason=self.allocation_stop_reason,
+                            zero_rank_reason="allocation_stopped_consolidation",
+                            module_active_ranks_after=snapshot[
+                                "module_active_ranks"
+                            ],
+                            **snapshot,
+                        )
                 self._maybe_tb_writter_log(model)
                 return 0, None
             consolidation_boundary = max(

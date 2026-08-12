@@ -468,6 +468,7 @@ def score_virtual_candidate(
             "calibration_gain_lcb": 0.0,
             "calibration_gain_per_parameter": 0.0,
             "calibration_valid": True,
+            "calibration_invalid_reason": None,
             "loss_scale": loss_scale,
             "virtual_update_scale": virtual_update_scale,
             "calibration_runtime_seconds": runtime,
@@ -490,6 +491,7 @@ def score_virtual_candidate(
         model, optimizer, scheduler, affected_parameters
     )
     fold_details = []
+    invalid_reason = None
     try:
         for fold_index, (batch_a, batch_b) in enumerate(pairs):
             # Every fold starts from the exact real-trajectory state.
@@ -501,6 +503,7 @@ def score_virtual_candidate(
                 loss_before = _loss_tensor(loss_fn(model, _clone_value(batch_b)))
                 loss_before_value = float(loss_before.detach().float().item())
             if not math.isfinite(loss_before_value):
+                invalid_reason = "non_finite_baseline_loss"
                 fold_details.append(
                     {
                         "fold": fold_index,
@@ -520,6 +523,7 @@ def score_virtual_candidate(
             _seed_fold_rng(gradient_seed)
             loss_a = _loss_tensor(loss_fn(model, _clone_value(batch_a)))
             if not bool(torch.isfinite(loss_a.detach()).all()):
+                invalid_reason = "non_finite_calibration_training_loss"
                 fold_details.append(
                     {
                         "fold": fold_index,
@@ -544,6 +548,7 @@ def score_virtual_candidate(
                 and not bool(torch.isfinite(parameter.grad).all())
                 for parameter in model.parameters()
             ):
+                invalid_reason = "non_finite_calibration_gradient"
                 fold_details.append(
                     {
                         "fold": fold_index,
@@ -566,6 +571,7 @@ def score_virtual_candidate(
                     update_scale=virtual_update_scale,
                 )
             except FloatingPointError:
+                invalid_reason = "non_finite_virtual_optimizer_update"
                 fold_details.append(
                     {
                         "fold": fold_index,
@@ -581,6 +587,8 @@ def score_virtual_candidate(
             with torch.no_grad():
                 loss_after = _loss_tensor(loss_fn(model, _clone_value(batch_b)))
                 loss_after_value = float(loss_after.detach().float().item())
+            if not math.isfinite(loss_after_value) and invalid_reason is None:
+                invalid_reason = "non_finite_post_update_loss"
             gain = loss_before_value - loss_after_value
             fold_details.append(
                 {
@@ -618,6 +626,7 @@ def score_virtual_candidate(
         "calibration_gain_lcb": lcb,
         "calibration_gain_per_parameter": gain_per_parameter,
         "calibration_valid": valid,
+        "calibration_invalid_reason": invalid_reason,
         "loss_scale": loss_scale,
         "virtual_update_scale": virtual_update_scale,
         "calibration_runtime_seconds": time.perf_counter() - started,
