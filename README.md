@@ -54,6 +54,22 @@ pdflatex -interaction=nonstopmode -halt-on-error cgear_final_report.tex
 
 The regeneration script validates all 12 completed run artifacts before writing any paper statistics. Environment and exact allocator settings are preserved in [`final_report/data/experiment_configuration.json`](final_report/data/experiment_configuration.json); the complete workflow is documented in [`final_report/README.md`](final_report/README.md).
 
+### Telemetry and offline analysis
+
+The maintained allocator wrappers enable `--rank_telemetry true` and write an append-only `telemetry.jsonl` in each run's root output directory. Telemetry is observational: it records the `rank_telemetry.v1` run lifecycle, allocation/calibration decisions, evaluations, checkpoints, active-rank maps, and parameter counts without performing extra model evaluations or changing allocator behavior. Checkpoint resumes append a separate process segment rather than overwriting prior evidence.
+
+For standalone analysis, parse one or more telemetry files and then plot only the validated derived CSVs:
+
+```bash
+python analysis/parse_rank_telemetry.py /path/to/telemetry.jsonl \
+  --output-dir /path/to/derived_tables
+python analysis/plot_rank_telemetry.py \
+  --input-dir /path/to/derived_tables \
+  --output-dir /path/to/figures
+```
+
+The parser produces rank, module-rank, allocation, calibration, and evaluation tables. It keeps resumed lineages separate and distinguishes the selected best checkpoint from the final allocation trajectory, preventing checkpoint accuracy from being paired with a different architecture's parameter count. The canonical six-seed workflow above invokes this parser automatically.
+
 ## Repository Overview
 
 There are several directories in this repo:
