@@ -14,8 +14,8 @@ This directory contains the canonical, lightweight final-project evidence for **
 - `data/run_manifest.csv`: exact selected run directory and best-checkpoint provenance.
 - `data/telemetry/`: schema-validated trajectory, module-rank, allocation, calibration, and evaluation tables for all 12 runs.
 - `figures/`: four paper figures plus five presentation/diagnostic figures and `figure_manifest.json`.
-- `scripts/regenerate_six_seed_analysis.py`: validates the actual artifacts and regenerates canonical data and LaTeX values.
-- `scripts/generate_report_figures.py`: regenerates every report/presentation figure from canonical CSV files.
+
+The canonical regeneration and plotting tools are maintained in the repository's top-level `analysis/` directory.
 
 ## Official evidence provenance
 
@@ -44,8 +44,8 @@ From the repository root:
 
 ```bash
 source /home/ali/LoRa_Project/.venv/bin/activate
-python final_report/scripts/regenerate_six_seed_analysis.py
-python final_report/scripts/generate_report_figures.py
+python analysis/regenerate_six_seed_analysis.py
+python analysis/generate_report_figures.py
 ```
 
 The first command fails loudly if a run is missing, incomplete, mismatched, or disagrees across telemetry, rank-pattern, checkpoint, trainer-state, and result artifacts. It also invokes the canonical `analysis/parse_rank_telemetry.py` parser to regenerate the five telemetry tables.
@@ -60,18 +60,7 @@ pdflatex -interaction=nonstopmode -halt-on-error cgear_final_report.tex
 pdflatex -interaction=nonstopmode -halt-on-error cgear_final_report.tex
 ```
 
-Alternatively, after activating the environment, `bash final_report/scripts/build_report.sh` performs data validation, figure generation, compilation, page-count/log checks, and page rendering in one command.
-
-For visual QA, render from the repository root with:
-
-```bash
-mkdir -p final_report/rendered
-mutool draw -q -r 180 \
-  -o final_report/rendered/page-%d.png \
-  final_report/paper/cgear_final_report.pdf
-```
-
-`final_report/rendered/` and LaTeX intermediates are ignored; the PDF, source, canonical data, and figures are versioned.
+Alternatively, after activating the environment, `bash analysis/build_final_report.sh` performs data validation, figure generation, compilation, and page-count/log checks in one command. LaTeX intermediates are ignored; the PDF, source, canonical data, and figures are versioned.
 
 ## Figures
 

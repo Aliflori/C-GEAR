@@ -43,8 +43,8 @@ Use new names for every run; the calibrated wrapper refuses to overwrite a popul
 ```bash
 cd /home/ali/LoRa_Project/IncreLoRA
 source /home/ali/LoRa_Project/.venv/bin/activate
-python final_report/scripts/regenerate_six_seed_analysis.py
-python final_report/scripts/generate_report_figures.py
+python analysis/regenerate_six_seed_analysis.py
+python analysis/generate_report_figures.py
 cd final_report/paper
 pdflatex -interaction=nonstopmode -halt-on-error cgear_final_report.tex
 bibtex cgear_final_report

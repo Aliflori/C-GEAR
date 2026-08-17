@@ -408,7 +408,7 @@ def write_markdown(path: Path, rows: list[dict], summary: dict) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    repository = Path(__file__).resolve().parents[2]
+    repository = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository", type=Path, default=repository)
     parser.add_argument("--output-dir", type=Path, default=repository / "final_report" / "data")

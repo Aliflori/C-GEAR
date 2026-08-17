@@ -374,7 +374,7 @@ def calibration_history(calibration_df: pd.DataFrame, output_dir: Path, seed: in
 
 
 def parse_args() -> argparse.Namespace:
-    repository = Path(__file__).resolve().parents[2]
+    repository = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=repository / "final_report" / "data")
     parser.add_argument("--output-dir", type=Path, default=repository / "final_report" / "figures")
