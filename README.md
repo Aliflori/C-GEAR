@@ -1,5 +1,59 @@
 # IncreLoRA: Incremental Parameter Allocation Method for Parameter-Efficient Fine-tuning
 
+## C-GEAR final project
+
+This fork adds **C-GEAR (Calibrated Genetic Efficiency-Aware Rank Allocation)** to the original IncreLoRA training stack. The implementation is exposed as `rank_allocator=genetic_budgeted_calibrated`: it combines Greedy-anchored evolutionary search, training-only candidate calibration, adaptive event size (including no growth), hard active-parameter budgeting, and allocation stopping. The original Greedy allocator and broader IncreLoRA task support remain available.
+
+The official local comparison uses GLUE RTE, `microsoft/deberta-v3-base`, and matched seeds 41--46. At selected checkpoints, C-GEAR obtains **88.09% ± 1.14** accuracy versus **87.30% ± 0.84** for Greedy, with mean active parameters of **795,225** versus **828,005**. C-GEAR wins/ties/loses 4/0/2 seeds. The mean paired selected-parameter reduction is 3.55%. Terminal architectures are reported separately: C-GEAR reduces active parameters by 13.86% on average per matched pair and finishes at mean rank 89.7 versus 144.0.
+
+The final three-page, two-column paper is at [`final_report/paper/cgear_final_report.pdf`](final_report/paper/cgear_final_report.pdf). Its source data, figures, scripts, and audit documentation are under [`final_report/`](final_report/).
+
+### Reproduce the RTE training commands
+
+Activate the existing environment and enter `NLU`:
+
+```bash
+cd /home/ali/LoRa_Project/IncreLoRA/NLU
+source /home/ali/LoRa_Project/.venv/bin/activate
+```
+
+For a new Greedy run (example seed 41), use a unique experiment name and tee the complete shell output:
+
+```bash
+set -o pipefail
+mkdir -p ./output/glue/rte_allocator/greedy/repro_greedy_s41_seed41
+CUDA_VISIBLE_DEVICES=0 bash scripts/rank=2/run_rte_allocator.sh \
+  repro_greedy_s41 greedy 41 2>&1 \
+  | tee ./output/glue/rte_allocator/greedy/repro_greedy_s41_seed41/terminal.log
+```
+
+Then run matched C-GEAR using that Greedy final rank pattern as the budget reference. The wrapper itself writes `terminal.log`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/rank=2/run_rte_allocator.sh \
+  repro_cgear_s41 genetic_budgeted_calibrated 41 \
+  /home/ali/LoRa_Project/IncreLoRA/NLU/output/glue/rte_allocator/greedy/repro_greedy_s41_seed41/rank_pattern.json \
+  0.94
+```
+
+Use new names for every run; the calibrated wrapper refuses to overwrite a populated result directory.
+
+### Regenerate final results and figures (no training)
+
+```bash
+cd /home/ali/LoRa_Project/IncreLoRA
+source /home/ali/LoRa_Project/.venv/bin/activate
+python final_report/scripts/regenerate_six_seed_analysis.py
+python final_report/scripts/generate_report_figures.py
+cd final_report/paper
+pdflatex -interaction=nonstopmode -halt-on-error cgear_final_report.tex
+bibtex cgear_final_report
+pdflatex -interaction=nonstopmode -halt-on-error cgear_final_report.tex
+pdflatex -interaction=nonstopmode -halt-on-error cgear_final_report.tex
+```
+
+The regeneration script validates all 12 completed run artifacts before writing any paper statistics. Environment and exact allocator settings are preserved in [`final_report/data/experiment_configuration.json`](final_report/data/experiment_configuration.json); the complete workflow is documented in [`final_report/README.md`](final_report/README.md).
+
 ## Repository Overview
 
 There are several directories in this repo:

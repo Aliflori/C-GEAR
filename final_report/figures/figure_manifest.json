@@ -1,0 +1,21 @@
+{
+  "schema_version": "cgear_report_figures.v1",
+  "source_data": "/home/ali/LoRa_Project/IncreLoRA/final_report/data",
+  "paper_figures": [
+    "method_workflow.png",
+    "accuracy_efficiency.png",
+    "rank_behavior.png",
+    "module_family_rank_distribution.png"
+  ],
+  "generated_files": [
+    "method_workflow.png",
+    "accuracy_efficiency.png",
+    "rank_behavior.png",
+    "accuracy_by_seed.png",
+    "active_parameters_by_seed.png",
+    "final_rank_by_layer.png",
+    "module_family_rank_distribution.png",
+    "compact_rank_heatmap_seed41.png",
+    "calibration_history_seed41.png"
+  ]
+}

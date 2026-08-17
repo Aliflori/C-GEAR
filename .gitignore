@@ -18,3 +18,12 @@
 **/rng_state*.pth
 **/training_args.bin
 **/events.out.tfevents.*
+
+# Local review transfer and report build intermediates
+/HEY ALI.zip
+/final_report/rendered/
+/final_report/paper/*.aux
+/final_report/paper/*.bbl
+/final_report/paper/*.blg
+/final_report/paper/*.out
+/final_report/paper/*.toc
