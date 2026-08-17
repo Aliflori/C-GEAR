@@ -9,7 +9,6 @@
 \usepackage{amsmath}
 \usepackage{url}
 \usepackage[hidelinks]{hyperref}
-\usepackage{balance}
 \usepackage{xcolor}
 \hypersetup{
   pdftitle={C-GEAR: Calibrated Genetic Efficiency-Aware Rank Allocation for Incremental LoRA Fine-Tuning},
@@ -20,6 +19,7 @@
 \setlength{\parindent}{0.9em}
 \setlength{\parskip}{0pt}
 \setlength{\textfloatsep}{5pt plus 1pt minus 1pt}
+\setlength{\dbltextfloatsep}{5pt plus 1pt minus 1pt}
 \setlength{\floatsep}{4pt plus 1pt minus 1pt}
 \setlength{\intextsep}{4pt plus 1pt minus 1pt}
 \setlength{\abovecaptionskip}{2pt}
@@ -58,7 +58,7 @@ Low-rank adaptation (LoRA) freezes a pretrained model and learns low-rank update
 This work asks whether incremental rank growth can become more selective and parameter-efficient without sacrificing downstream performance. C-GEAR answers with (i) Greedy-anchored evolutionary search over non-uniform module sets, (ii) conservative training-only calibration, (iii) adaptive event size $k$ including $k=0$, and (iv) explicit budget and stopping logic. Beyond the allocator, the project contributes dynamic-checkpoint reconstruction, candidate snapshot/restore, budget-correct parameter accounting, regression tests, and a schema-validated telemetry/analysis pipeline. Code and reproducibility artifacts are available at \url{https://github.com/Aliflori/colabLoRA}.
 
 \section{Related Work}
-Adaptive LoRA methods relax a single hand-chosen rank in different ways. AdaLoRA allocates a global budget by importance \cite{zhang2023adalora}; DyLoRA jointly trains a nested range of usable ranks \cite{valipour2023dylora}; SoRA learns sparse rank gates \cite{ding2023sora}; AutoLoRA uses meta-learning to tune layer ranks \cite{zhang2024autolora}; and DoRA dynamically prunes structured rank-one components \cite{mao2024dora}. IncreLoRA reverses pruning by progressively adding components, avoiding a restrictive initial upper rank \cite{zhang2023increlora}. C-GEAR retains this incremental setting but targets a different gap: \emph{which combination} should grow at an event, by how much, and whether growth is warranted at all.
+Adaptive LoRA methods relax a single hand-chosen rank in different ways. AdaLoRA allocates a global budget by importance \cite{zhang2023adalora}; DyLoRA jointly trains a nested range of usable ranks \cite{valipour2023dylora}; SoRA learns sparse rank gates \cite{ding2023sora}; AutoLoRA uses meta-learning to tune layer ranks \cite{zhang2024autolora}; and dynamic-rank DoRA prunes structured rank-one components \cite{mao2024dora}. IncreLoRA reverses pruning by progressively adding components, avoiding a restrictive initial upper rank \cite{zhang2023increlora}. C-GEAR retains this incremental setting but targets a different gap: \emph{which combination} should grow at an event, by how much, and whether growth is warranted at all.
 
 \section{Method / Proposed Approach}
 Let module $i$ have active rank $r_i$ and dimensions $d_{\mathrm{in},i}$ and $d_{\mathrm{out},i}$. Its active adaptation cost is
@@ -70,7 +70,7 @@ At an allocation event, C-GEAR constructs legal module sets for $k\in\{0,\ldots,
 \begin{figure}[H]
 \centering
 \includegraphics[width=\columnwidth]{../figures/method_workflow.png}
-\caption{One C-GEAR allocation event. Candidate calibration never uses validation labels; repeated reliable $k=0$ decisions trigger consolidation rather than later rank growth.}
+\caption{One C-GEAR allocation event. Candidate calibration never uses validation labels; repeated $k=0$ decisions trigger consolidation rather than later rank growth.}
 \label{fig:method}
 \end{figure}
 
@@ -88,6 +88,7 @@ We perform a controlled local comparison on GLUE RTE \cite{wang2019glue} with \t
 Efficiency is \emph{active model parameters}: the fixed task head plus components represented by the active rank pattern, not raw \texttt{requires\_grad} storage. ``Selected'' denotes the checkpoint chosen by validation accuracy after dynamic-rank restoration; ``final'' denotes the terminal allocation trajectory before that checkpoint is reloaded. We pair accuracy only with selected-checkpoint counts. This is a matched local reproduction, not a direct numerical comparison with differently configured results in the original IncreLoRA paper.
 
 \section{Results \& Contributions}
+\subsection{Outcome-Level Evidence}
 Table~\ref{tab:main-results} gives the central comparison. C-GEAR raises mean accuracy by \AccuracyGain\ percentage points and wins/ties/loses \CgearWins/\CgearTies/\CgearLosses\ matched seeds. At those \emph{same selected checkpoints}, mean active parameters fall from 828,005 to 795,225 and mean active rank from 99.0 to 86.7. The primary paired reduction is \SelectedPairedReduction\%; the reduction computed from aggregate mean counts is 3.96\%, illustrating why the paired statistic must be labeled.
 
 \begin{figure}[!t]
@@ -99,6 +100,7 @@ Table~\ref{tab:main-results} gives the central comparison. C-GEAR raises mean ac
 
 Figure~\ref{fig:tradeoff} exposes rather than hides variation: C-GEAR loses on seeds 42 and 43, and selected efficiency is not lower for every pair. Nonetheless, the mean selected-checkpoint trade-off favors C-GEAR. Separately, final trajectories average 804,060 active parameters and rank 89.7, versus Greedy's 933,650 and rank 144; the mean paired final-parameter reduction is \FinalPairedReduction\%. These terminal counts do \emph{not} inherit selected-checkpoint accuracy.
 
+\subsection{Mechanistic Analysis}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{../figures/rank_behavior.png}
@@ -106,19 +108,22 @@ Figure~\ref{fig:tradeoff} exposes rather than hides variation: C-GEAR loses on s
 \label{fig:growth}
 \end{figure}
 
-Telemetry supports the mechanism-level interpretation (Fig.~\ref{fig:growth}). Greedy reaches rank 144 in every run. C-GEAR finishes between ranks 72 and 107, mixes positive event sizes with $k=0$, and sometimes stops growth at step 300 while the fixed architecture continues optimizing and yields a later best checkpoint. Thus C-GEAR does not merely choose a smaller common target: it learns distinct non-uniform growth schedules. The terminal family profile (Fig.~\ref{fig:family}) likewise shows redistribution rather than uniform scaling. Calibration and search add a measured 13.4\% mean wall-time overhead in this local setup.
-
-\begin{figure}[!t]
+\begin{figure*}[!t]
 \centering
-\includegraphics[width=\columnwidth]{../figures/module_family_rank_distribution.png}
-\caption{Mean terminal rank summed over 12 layers. C-GEAR does not shrink every family proportionally: compared with Greedy, it preserves relatively more FFN-output rank while reducing other families.}
-\label{fig:family}
-\end{figure}
+\includegraphics[width=0.99\textwidth]{../figures/mechanistic_rank_allocation.png}
+\caption{Allocation structure. (a) Added rank above the common rank-one initialization, summed by family per seed and shown as mean $\pm$ sample SD over seeds 41--46. (b) Final layer $\times$ module-family maps for representative seed 41 under a shared active-rank scale. C-GEAR changes both the amount and placement of rank.}
+\label{fig:allocation-structure}
+\end{figure*}
+
+Figure~\ref{fig:growth} separates rank-growth behavior from the outcome comparison. Greedy adds 72 ranks in every run and reaches rank 144. C-GEAR's 55 genuine calibrated decisions use every event size from $k=0$ to $k=5$: 15 select no growth, while the positive decisions produce seed-dependent terminal ranks from 72 to 107. Four runs stop after consecutive $k=0$ decisions; two instead enter the required final consolidation window. Optimization continues with the resulting fixed pattern after allocation stops.
+
+Evolutionary exploration also affects committed allocations: global-GA candidates supply 13 of the 40 positive-growth decisions rather than every event reverting to the Greedy anchor. For representative seed 41, training-only calibration evaluates 105 shortlisted candidates over 15 events, selects global-GA candidates three times, and selects $k=0$ twice. Its full calibration history remains available as an auxiliary figure. Budget feasibility is enforced for every candidate; the representative seed-41 trace does not itself exhibit budget pressure.
+
+Figure~\ref{fig:allocation-structure} shows that the smaller C-GEAR architectures are not proportional copies of Greedy. At seed 41, the final maps differ in 42 of 72 layer--family cells; C-GEAR assigns more rank in 12 cells despite using total rank 107 instead of 144. The four C-GEAR runs that grow beyond initialization develop non-uniform maps, whereas seeds 42 and 46 retain rank one throughout. Thus telemetry demonstrates changes in both \emph{how much} rank is allocated and, when growth occurs, \emph{where}; it does not establish that a particular pattern causally improves accuracy. Calibration and search add a measured 13.4\% mean wall-time overhead in this local setup.
 
 \section{Future Work \& Conclusion}
 The evidence is deliberately narrow: one GLUE task, one backbone, one laptop GPU, and six seeds. It does not establish statistical significance or cross-task generalization. Broader GLUE and model evaluation, larger seed sets, calibration/search ablations, and hardware-aware latency or memory objectives are natural next steps. Within this controlled study, C-GEAR supplies both a methodological improvement and a substantial implementation: it converts compulsory local Greedy growth into calibrated, budget-aware evolutionary decisions. Across six matched RTE seeds, it improves mean accuracy while using fewer selected-checkpoint parameters, and its final architectures grow substantially less.
 
-\balance
 \bibliographystyle{abbrv}
 {\footnotesize\bibliography{references}}
 \end{document}

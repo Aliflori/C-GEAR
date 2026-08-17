@@ -5,7 +5,7 @@
     "method_workflow.png",
     "accuracy_efficiency.png",
     "rank_behavior.png",
-    "module_family_rank_distribution.png"
+    "mechanistic_rank_allocation.png"
   ],
   "generated_files": [
     "method_workflow.png",
@@ -16,6 +16,7 @@
     "final_rank_by_layer.png",
     "module_family_rank_distribution.png",
     "compact_rank_heatmap_seed41.png",
+    "mechanistic_rank_allocation.png",
     "calibration_history_seed41.png"
   ]
 }

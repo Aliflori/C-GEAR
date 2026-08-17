@@ -356,6 +356,146 @@ def compact_rank_heatmap(module_df: pd.DataFrame, output_dir: Path, seed: int = 
     return save(fig, output_dir, f"compact_rank_heatmap_seed{seed}")
 
 
+def mechanistic_rank_allocation(module_df: pd.DataFrame, output_dir: Path, seed: int = 41) -> Path:
+    """Combine aggregate and representative final-rank structure in one figure."""
+    final = module_df[module_df.state_role == "final_trajectory"].copy()
+    families = ["attention_query", "attention_key", "attention_value", "attention_output", "ffn_intermediate", "ffn_output"]
+    family_labels = ["Query", "Key", "Value", "Attn out", "FFN in", "FFN out"]
+    heatmap_labels = ["Q", "K", "V", "Attn\nout", "FFN\nin", "FFN\nout"]
+    methods = (("greedy", "Greedy IncreLoRA"), ("genetic_budgeted_calibrated", "C-GEAR"))
+
+    # Show growth above the shared rank-one initialization rather than total
+    # active rank: this isolates what each allocator actually added. Aggregate
+    # only after per-seed family totals are computed so every run contributes
+    # equally even though C-GEAR stops at different active ranks.
+    initial = module_df[module_df.state_role == "initial_trajectory"]
+    totals = final.groupby(["method", "seed", "module_family"], as_index=False).active_rank.sum()
+    baselines = initial.groupby(["method", "seed", "module_family"], as_index=False).active_rank.sum()
+    growth = totals.merge(
+        baselines,
+        on=["method", "seed", "module_family"],
+        how="inner",
+        suffixes=("_final", "_initial"),
+        validate="one_to_one",
+    )
+    growth["added_rank"] = growth.active_rank_final - growth.active_rank_initial
+    if (growth.added_rank < 0).any():
+        raise ValueError("Final module-family rank cannot be lower than its initialization.")
+    stats = growth.groupby(["method", "module_family"], as_index=False).added_rank.agg(["mean", "std"]).reset_index()
+
+    representative = final[final.seed == seed]
+    expected_rows = 12 * len(families)
+    for method, _ in methods:
+        method_rows = representative[representative.method == method]
+        if len(method_rows) != expected_rows:
+            raise ValueError(
+                f"Expected {expected_rows} final module ranks for {method} seed {seed}, "
+                f"found {len(method_rows)}."
+            )
+
+    fig = plt.figure(figsize=(7.15, 3.25), constrained_layout=True)
+    outer = fig.add_gridspec(1, 2, width_ratios=(1.05, 1.72), wspace=0.10)
+
+    # Panel (a): six-seed family growth with variability across matched runs.
+    ax = fig.add_subplot(outer[0, 0])
+    y = np.arange(len(families))
+    height = 0.36
+    for index, (method, label) in enumerate(methods):
+        method_stats = stats[stats.method == method].set_index("module_family")
+        means = method_stats.reindex(families)["mean"].to_numpy()
+        deviations = method_stats.reindex(families)["std"].to_numpy()
+        offset = (index - 0.5) * height
+        ax.barh(
+            y + offset,
+            means,
+            height,
+            xerr=deviations,
+            color=METHOD_COLORS[label],
+            edgecolor="white",
+            linewidth=0.35,
+            error_kw={"ecolor": "#454545", "elinewidth": 0.65, "capsize": 1.5, "capthick": 0.65},
+            label=label,
+        )
+        for family_y, mean_value in zip(y + offset, means):
+            if np.isclose(mean_value, 0.0):
+                ax.text(0.25, family_y, "0", va="center", ha="left", fontsize=5.6, fontweight="bold", color=METHOD_COLORS[label])
+    ax.set_title("(a) Six-seed mean rank growth by family", loc="left", fontweight="bold", fontsize=7.9, pad=4)
+    ax.set_xlabel(r"Added rank above rank-one initialization (mean $\pm$ SD)")
+    ax.set_yticks(y, family_labels)
+    ax.invert_yaxis()
+    upper_rank = int(np.ceil(max((stats["mean"] + stats["std"]).max(), 5) / 5.0) * 5)
+    ax.set_xlim(0, upper_rank)
+    ax.set_xticks(np.arange(0, upper_rank, 10))
+    ax.grid(axis="y", visible=False)
+    ax.legend(loc="lower right", fontsize=6.1)
+
+    # Panel (b): the two methods share one color normalization, making their
+    # representative per-layer ranks directly comparable.
+    heat_grid = outer[0, 1].subgridspec(2, 1, hspace=0.12)
+    heat_axes = [fig.add_subplot(heat_grid[row, 0]) for row in range(2)]
+    vmax = int(representative.active_rank.max())
+    norm = colors.Normalize(vmin=1, vmax=vmax)
+    image = None
+    for row, (axis, (method, label)) in enumerate(zip(heat_axes, methods)):
+        subset = representative[representative.method == method]
+        pivot = (
+            subset.pivot_table(
+                index="transformer_layer",
+                columns="module_family",
+                values="active_rank",
+                aggfunc="sum",
+            )
+            .reindex(index=range(12), columns=families)
+        )
+        if pivot.isna().any().any():
+            raise ValueError(f"Incomplete final rank map for {method} seed {seed}.")
+        image = axis.imshow(pivot.to_numpy(), aspect="auto", cmap="YlGnBu", norm=norm, interpolation="nearest")
+        for layer in range(12):
+            for family_index in range(len(families)):
+                value = int(pivot.iloc[layer, family_index])
+                axis.text(
+                    family_index,
+                    layer,
+                    str(value),
+                    ha="center",
+                    va="center",
+                    fontsize=5.1,
+                    color="white" if norm(value) > 0.58 else "#1E252B",
+                )
+        if row == 0:
+            axis.set_title(
+                f"(b) Representative rank map (seed {seed})",
+                loc="left",
+                fontweight="bold",
+                fontsize=7.9,
+                pad=8,
+            )
+            axis.tick_params(axis="x", bottom=False, labelbottom=False)
+        else:
+            axis.set_xticks(range(len(families)), heatmap_labels)
+            axis.set_xlabel("Module family", labelpad=1)
+        axis.set_yticks(range(12), range(12))
+        axis.set_ylabel("Layer", labelpad=2)
+        axis.grid(False)
+        axis.text(
+            1.0,
+            1.015,
+            label,
+            transform=axis.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=6.4,
+            fontweight="bold",
+            color=METHOD_COLORS[label],
+        )
+
+    assert image is not None
+    cbar = fig.colorbar(image, ax=heat_axes, fraction=0.030, pad=0.018, ticks=range(1, vmax + 1))
+    cbar.set_label("Active rank", labelpad=3)
+    cbar.ax.tick_params(labelsize=6)
+    return save(fig, output_dir, "mechanistic_rank_allocation")
+
+
 def calibration_history(calibration_df: pd.DataFrame, output_dir: Path, seed: int = 41) -> Path:
     data = calibration_df[(calibration_df.seed == seed) & (calibration_df.method == "genetic_budgeted_calibrated")].copy()
     data = data[pd.to_numeric(data.calibration_gain_lcb, errors="coerce").notna()]
@@ -399,6 +539,7 @@ def main() -> None:
         final_rank_by_layer(module_df, output_dir),
         family_distribution(module_df, output_dir),
         compact_rank_heatmap(module_df, output_dir, seed=41),
+        mechanistic_rank_allocation(module_df, output_dir, seed=41),
         calibration_history(calibration_df, output_dir, seed=41),
     ]
     manifest = {
@@ -408,7 +549,7 @@ def main() -> None:
             "method_workflow.png",
             "accuracy_efficiency.png",
             "rank_behavior.png",
-            "module_family_rank_distribution.png",
+            "mechanistic_rank_allocation.png",
         ],
         "generated_files": [path.name for path in generated],
     }

@@ -13,7 +13,7 @@ This directory contains the canonical, lightweight final-project evidence for **
 - `data/experiment_configuration.json`: training, LoRA, allocator, software, and hardware metadata recovered from telemetry.
 - `data/run_manifest.csv`: exact selected run directory and best-checkpoint provenance.
 - `data/telemetry/`: schema-validated trajectory, module-rank, allocation, calibration, and evaluation tables for all 12 runs.
-- `figures/`: four paper figures plus five presentation/diagnostic figures and `figure_manifest.json`.
+- `figures/`: four paper figures plus six presentation/diagnostic figures and `figure_manifest.json`.
 
 The canonical regeneration and plotting tools are maintained in the repository's top-level `analysis/` directory.
 
@@ -69,6 +69,6 @@ The PDF includes:
 1. C-GEAR allocation-event schematic;
 2. matched-seed accuracy and selected-checkpoint accuracy--efficiency trade-off;
 3. active-rank growth and C-GEAR event-size history;
-4. final module-family rank distribution.
+4. aggregate module-family allocation and a representative seed-41 layer--family rank map.
 
-Additional generated figures cover per-seed accuracy, selected/final active parameters, layer-wise final rank, a representative compact rank heatmap, and calibration history. They are intended for review or later presentation material, not as extra evidence silently omitted from the paper.
+Additional generated figures cover per-seed accuracy, selected/final active parameters, layer-wise final rank, the standalone module-family distribution, a representative compact rank heatmap, and calibration history. They are intended for review or later presentation material, not as extra evidence silently omitted from the paper.
