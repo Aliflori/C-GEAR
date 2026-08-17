@@ -19,11 +19,7 @@
 **/training_args.bin
 **/events.out.tfevents.*
 
-# Local review transfer and report build intermediates
-/HEY ALI.zip
-/history/old_runs/
-/history/old_logs/
-/history/old_packages/
+# Report build intermediates
 /final_report/rendered/
 /final_report/paper/*.aux
 /final_report/paper/*.bbl

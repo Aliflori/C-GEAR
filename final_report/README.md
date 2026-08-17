@@ -16,8 +16,6 @@ This directory contains the canonical, lightweight final-project evidence for **
 - `figures/`: four paper figures plus five presentation/diagnostic figures and `figure_manifest.json`.
 - `scripts/regenerate_six_seed_analysis.py`: validates the actual artifacts and regenerates canonical data and LaTeX values.
 - `scripts/generate_report_figures.py`: regenerates every report/presentation figure from canonical CSV files.
-- `course_requirements_checklist.md`: explicit audit against the authoritative course definition.
-- `cleanup_summary.md`: conservative repository-cleanup record.
 
 ## Official evidence provenance
 
