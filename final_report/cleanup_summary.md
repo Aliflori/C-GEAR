@@ -20,3 +20,13 @@ Cleanup was deliberately conservative because the repository contains scientific
 ## Deletions
 
 No tracked source, test, script, or scientific output was deleted. The audit found no clearly dead project-specific tracked file whose removal was safer than preservation. The local review ZIP was not deleted; it is simply excluded from version control because its canonical contents are represented by source, summaries, and report artifacts.
+
+## Subsequent historical archival
+
+A later conservative workspace audit compared this tree with the authoritative
+upstream IncreLoRA repository before classifying artifacts. Superseded
+project-specific runs, loose development logs, two obsolete RTE wrappers, the
+earlier five-seed analysis snapshot, and the temporary review ZIP were moved
+to `history/`; none were deleted. The canonical Greedy and C-GEAR
+`ali_last_seed{41..46}` runs remain at their original paths. The detailed
+pre-move inventory and rationale are in `history/cleanup_inventory.md`.

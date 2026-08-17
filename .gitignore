@@ -21,6 +21,9 @@
 
 # Local review transfer and report build intermediates
 /HEY ALI.zip
+/history/old_runs/
+/history/old_logs/
+/history/old_packages/
 /final_report/rendered/
 /final_report/paper/*.aux
 /final_report/paper/*.bbl
