@@ -1,3 +1,4 @@
+\pdfminorversion=7
 \documentclass[10pt,twocolumn]{article}
 \usepackage[letterpaper,top=0.49in,bottom=0.52in,left=0.55in,right=0.55in,columnsep=0.20in]{geometry}
 \usepackage[T1]{fontenc}
@@ -57,28 +58,43 @@ Low-rank adaptation (LoRA) freezes a pretrained model and learns low-rank update
 
 This work asks whether incremental rank growth can become more selective and parameter-efficient without sacrificing downstream performance. C-GEAR answers with (i) Greedy-anchored evolutionary search over non-uniform module sets, (ii) conservative training-only calibration, (iii) adaptive event size $k$ including $k=0$, and (iv) explicit budget and stopping logic. Beyond the allocator, the project contributes dynamic-checkpoint reconstruction, candidate snapshot/restore, budget-correct parameter accounting, regression tests, and a schema-validated telemetry/analysis pipeline. Code and reproducibility artifacts are available at \url{https://github.com/Aliflori/colabLoRA}.
 
+Figures~\ref{fig:method-overview} and~\ref{fig:genetic-search} preview the event-level decision flow and the search that supplies its candidate allocations; Section~3 specifies the implementation.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{../figures/cgear_allocation_event.pdf}
+\caption{Overall C-GEAR allocation-event flow. Genetic search proposes feasible module sets; training-only calibration and conservative gates choose growth, no growth ($k=0$), or stopping after repeated no-growth events.}
+\label{fig:method-overview}
+\end{figure}
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=0.88\textwidth]{../figures/cgear_genetic_search.pdf}
+\caption{Inside the genetic search: an illustrative $k=3$ example, not a trace of a particular event. Individuals encode sets of layer--module pairs; Greedy anchoring, set crossover, add/remove/replace mutation, budget repair, elitism, and diversity produce a feasible calibration shortlist.}
+\label{fig:genetic-search}
+\end{figure*}
+
 \section{Related Work}
-Adaptive LoRA methods relax a single hand-chosen rank in different ways. AdaLoRA allocates a global budget by importance \cite{zhang2023adalora}; DyLoRA jointly trains a nested range of usable ranks \cite{valipour2023dylora}; SoRA learns sparse rank gates \cite{ding2023sora}; AutoLoRA uses meta-learning to tune layer ranks \cite{zhang2024autolora}; and dynamic-rank DoRA prunes structured rank-one components \cite{mao2024dora}. IncreLoRA reverses pruning by progressively adding components, avoiding a restrictive initial upper rank \cite{zhang2023increlora}. C-GEAR retains this incremental setting but targets a different gap: \emph{which combination} should grow at an event, by how much, and whether growth is warranted at all.
+Adaptive LoRA methods relax a single hand-chosen rank in different ways. AdaLoRA allocates a global budget by importance \cite{zhang2023adalora}; DyLoRA jointly trains a nested range of usable ranks \cite{valipour2023dylora}; SoRA learns sparse rank gates \cite{ding2023sora}; AutoLoRA uses meta-learning to tune layer ranks \cite{zhang2024autolora}; and dynamic-rank DoRA prunes rank-one components \cite{mao2024dora}. \mbox{IncreLoRA reverses pruning} by progressively adding components, avoiding a restrictive initial upper rank \cite{zhang2023increlora}. C-GEAR retains this incremental setting but targets a different gap: \emph{which combination} should grow at an event, by how much, and whether growth is warranted at all.
 
 \section{Method / Proposed Approach}
 Let module $i$ have active rank $r_i$ and dimensions $d_{\mathrm{in},i}$ and $d_{\mathrm{out},i}$. Its active adaptation cost is
 \begin{equation}
 C(\mathbf r)=\sum_i r_i(d_{\mathrm{in},i}+d_{\mathrm{out},i}), \qquad C(\mathbf r)\le B.
 \end{equation}
-At an allocation event, C-GEAR constructs legal module sets for $k\in\{0,\ldots,K\}$. A repaired Greedy solution is retained as a reference, while greedy-neighborhood, cost-aware, diversity-aware, and population-search candidates explore non-Greedy combinations. Set crossover, add/remove/replace mutation, elitism, and Hamming-diversity pressure operate under hard projected-cost feasibility; no post-hoc local search is used.
+At each event, C-GEAR first proposes budget-feasible allocations, then uses training-only evidence to decide among growth, no growth, and stopping (Figure~\ref{fig:method-overview}).
 
-\begin{figure}[H]
-\centering
-\includegraphics[width=\columnwidth]{../figures/method_workflow.png}
-\caption{One C-GEAR allocation event. Candidate calibration never uses validation labels; repeated $k=0$ decisions trigger consolidation rather than later rank growth.}
-\label{fig:method}
-\end{figure}
+\subsection{Genetic Rank-Allocation Search}
+An individual is the set of LoRA modules receiving the next $k$ rank-one components (Figure~\ref{fig:genetic-search}). Legal sizes are $k\in\{0,\ldots,K\}$, with the empty set representing a genuine no-growth action. The original IncreLoRA Greedy allocation remains the anchor and quality reference: C-GEAR retains a budget-repaired anchor and Greedy prefixes, enumerates nearby replacements, and seeds global populations with the anchor, cost/gain extremes, and random sets. Structural fitness combines normalized importance, complementary temporal interactions, redundancy, and relative parameter cost.
 
-Structural search alone is not trusted to commit a change. Each shortlist candidate is virtually materialized, updated on three held-out \emph{training} folds, and restored with model, optimizer, rank, and random-number state unchanged. For loss decrease $g_j$ on fold $j$, the implemented conservative score is
+Tournament-selected parents undergo set crossover; mutation can add, remove, or replace modules. Deterministic repair substitutes cheaper modules or reduces cardinality until projected active cost satisfies $B$. Environmental selection retains a strong elite, then applies maximin normalized set-Hamming pressure, where membership-vector distance is $|A\mathbin{\triangle}B|/\max(|A|,|B|,1)$, to discourage population collapse. After the configured generations, representative feasible candidates form the shortlist. No post-hoc local search is used. Evolution therefore proposes allocations from training-derived signals; it does not optimize against RTE validation labels.
+
+\subsection{Training-Only Calibration and Commit Decision}
+Search alone cannot commit a change. Each shortlist candidate is virtually materialized, updated on three held-out \emph{training} folds, and restored with model, optimizer, rank, and random-number state unchanged. For loss decrease $g_j$ on fold $j$, the implemented conservative score is
 \begin{equation}
 S_{\mathrm{cal}}=\bar g-\lambda\sigma_g,\qquad \lambda=0.5.
 \end{equation}
-A positive candidate must clear reliability, Greedy-quality, marginal-gain, and budget gates. The quality set is then ordered by projected active cost before calibrated quality. If none qualifies, $k=0$ leaves the rank pattern unchanged; two consecutive no-growth events stop allocation and begin ordinary consolidation training. Figure~\ref{fig:method} summarizes the decision path.
+Here $\bar g$ rewards expected improvement, while $\sigma_g$ penalizes instability across folds. The score is a conservative LCB-style heuristic, not a formal 95\% confidence bound. A positive candidate must clear validity, marginal-gain, Greedy-quality, and budget gates; global-only candidates face a stricter improvement gate. Within the quality band, projected active cost is minimized before calibrated quality breaks ties. If none qualifies, $k=0$ preserves the pattern; two consecutive no-growth events stop allocation and begin ordinary consolidation training. Calibration uses training data only and never validation labels.
 
 \section{Experimental Setup}
 We perform a controlled local comparison on GLUE RTE \cite{wang2019glue} with \texttt{microsoft/deberta-v3-base} \cite{he2023debertav3}. Greedy IncreLoRA and C-GEAR use identical seeds 41--46, data order, model, targets, and optimization: 25 epochs (1,950 steps), sequence length 192, train/evaluation batches 32/8, AdamW at $1.2\!\times\!10^{-3}$, linear scheduling with 100 warm-up steps, weight decay 0.01, and FP16 on an RTX 4060 Laptop GPU. Allocation begins from rank one in 72 target modules and is considered every 100 steps. C-GEAR uses population 12, four generations, calibration top-6, budget ratio 0.94, and the fixed settings recorded by telemetry. RTE validation accuracy is the performance metric.

@@ -546,10 +546,15 @@ def main() -> None:
         "schema_version": "cgear_report_figures.v1",
         "source_data": str(data_dir),
         "paper_figures": [
-            "method_workflow.png",
+            "cgear_allocation_event.pdf",
+            "cgear_genetic_search.pdf",
             "accuracy_efficiency.png",
             "rank_behavior.png",
             "mechanistic_rank_allocation.png",
+        ],
+        "supplied_vector_assets": [
+            "cgear_allocation_event.pdf",
+            "cgear_genetic_search.pdf",
         ],
         "generated_files": [path.name for path in generated],
     }

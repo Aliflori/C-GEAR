@@ -6,7 +6,7 @@ This fork adds **C-GEAR (Calibrated Genetic Efficiency-Aware Rank Allocation)** 
 
 The official local comparison uses GLUE RTE, `microsoft/deberta-v3-base`, and matched seeds 41--46. At selected checkpoints, C-GEAR obtains **88.09% ± 1.14** accuracy versus **87.30% ± 0.84** for Greedy, with mean active parameters of **795,225** versus **828,005**. C-GEAR wins/ties/loses 4/0/2 seeds. The mean paired selected-parameter reduction is 3.55%. Terminal architectures are reported separately: C-GEAR reduces active parameters by 13.86% on average per matched pair and finishes at mean rank 89.7 versus 144.0.
 
-The final three-page, two-column paper is at [`final_report/paper/cgear_final_report.pdf`](final_report/paper/cgear_final_report.pdf). Its source data, figures, scripts, and reproducibility documentation are under [`final_report/`](final_report/).
+The final four-page, two-column paper is at [`final_report/paper/cgear_final_report.pdf`](final_report/paper/cgear_final_report.pdf). Its source data, figures, scripts, and reproducibility documentation are under [`final_report/`](final_report/).
 
 ### Reproduce the RTE training commands
 

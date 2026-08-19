@@ -4,7 +4,7 @@ This directory contains the canonical, lightweight final-project evidence for **
 
 ## Contents
 
-- `paper/cgear_final_report.pdf`: final English, two-column scientific report (three pages).
+- `paper/cgear_final_report.pdf`: final English, two-column scientific report (four pages).
 - `paper/cgear_final_report.tex` and `paper/references.bib`: report source and verified bibliography.
 - `paper/results_macros.tex` and `paper/results_table.tex`: generated LaTeX quantities; do not edit manually.
 - `data/canonical_results_seeds_41_46.csv`: one validated row per method and seed.
@@ -13,7 +13,7 @@ This directory contains the canonical, lightweight final-project evidence for **
 - `data/experiment_configuration.json`: training, LoRA, allocator, software, and hardware metadata recovered from telemetry.
 - `data/run_manifest.csv`: exact selected run directory and best-checkpoint provenance.
 - `data/telemetry/`: schema-validated trajectory, module-rank, allocation, calibration, and evaluation tables for all 12 runs.
-- `figures/`: four paper figures plus six presentation/diagnostic figures and `figure_manifest.json`.
+- `figures/`: two supplied vector method diagrams, three generated paper figures, auxiliary presentation/diagnostic figures, and `figure_manifest.json`.
 
 The canonical regeneration and plotting tools are maintained in the repository's top-level `analysis/` directory.
 
@@ -66,9 +66,12 @@ Alternatively, after activating the environment, `bash analysis/build_final_repo
 
 The PDF includes:
 
-1. C-GEAR allocation-event schematic;
-2. matched-seed accuracy and selected-checkpoint accuracy--efficiency trade-off;
-3. active-rank growth and C-GEAR event-size history;
-4. aggregate module-family allocation and a representative seed-41 layer--family rank map.
+1. the overall C-GEAR allocation-event flow (`cgear_allocation_event.pdf`);
+2. the illustrative $k=3$ genetic-search process (`cgear_genetic_search.pdf`);
+3. matched-seed accuracy and selected-checkpoint accuracy--efficiency trade-off;
+4. active-rank growth and C-GEAR event-size history;
+5. aggregate module-family allocation and a representative seed-41 layer--family rank map.
+
+The two method diagrams are stored and embedded as PDF vector assets rather than converted to raster images.
 
 Additional generated figures cover per-seed accuracy, selected/final active parameters, layer-wise final rank, the standalone module-family distribution, a representative compact rank heatmap, and calibration history. They are intended for review or later presentation material, not as extra evidence silently omitted from the paper.

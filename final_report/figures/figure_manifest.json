@@ -2,10 +2,15 @@
   "schema_version": "cgear_report_figures.v1",
   "source_data": "/home/ali/LoRa_Project/IncreLoRA/final_report/data",
   "paper_figures": [
-    "method_workflow.png",
+    "cgear_allocation_event.pdf",
+    "cgear_genetic_search.pdf",
     "accuracy_efficiency.png",
     "rank_behavior.png",
     "mechanistic_rank_allocation.png"
+  ],
+  "supplied_vector_assets": [
+    "cgear_allocation_event.pdf",
+    "cgear_genetic_search.pdf"
   ],
   "generated_files": [
     "method_workflow.png",
