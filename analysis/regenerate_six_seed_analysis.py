@@ -462,6 +462,8 @@ def main() -> None:
             *[str(path) for path in telemetry_paths],
             "--output-dir",
             str(telemetry_output),
+            "--source-root",
+            str(repository),
         ],
         check=True,
     )

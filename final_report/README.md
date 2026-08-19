@@ -43,7 +43,7 @@ Percentage reductions in the paper are the mean of six seed-wise paired reductio
 From the repository root:
 
 ```bash
-source /home/ali/LoRa_Project/.venv/bin/activate
+source .venv/bin/activate
 python analysis/regenerate_six_seed_analysis.py
 python analysis/generate_report_figures.py
 ```

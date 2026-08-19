@@ -198,6 +198,36 @@ class RankTelemetryParserTest(unittest.TestCase):
             self.assertEqual(intermediate["module_group"], "ffn")
             self.assertEqual(query["transformer_layer"], "0")
 
+    def test_optional_source_root_writes_relative_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "runs" / "telemetry.jsonl"
+            output = root / "parsed"
+            source.parent.mkdir()
+            write_jsonl(source, valid_records())
+
+            TELEMETRY.parse_files([source], output, source_root=root)
+
+            for filename in TELEMETRY.OUTPUT_SCHEMAS:
+                with (output / filename).open(newline="", encoding="utf-8") as handle:
+                    rows = list(csv.DictReader(handle))
+                for row in rows:
+                    self.assertEqual(row["source_artifact"], "runs/telemetry.jsonl")
+
+    def test_source_root_rejects_inputs_outside_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "telemetry.jsonl"
+            output = root / "parsed"
+            allowed = root / "allowed"
+            allowed.mkdir()
+            write_jsonl(source, valid_records())
+
+            with self.assertRaisesRegex(
+                TELEMETRY.TelemetryValidationError, "outside source root"
+            ):
+                TELEMETRY.parse_files([source], output, source_root=allowed)
+
     def test_rejects_noncanonical_schema_version(self):
         records = valid_records()
         records[0]["schema_version"] = 1

@@ -1278,13 +1278,25 @@ def write_tables(tables, output_dir):
     return written
 
 
-def parse_files(inputs, output_dir):
+def parse_files(inputs, output_dir, source_root=None):
     combined = {filename: [] for filename in OUTPUT_SCHEMAS}
     resolved = [Path(path).resolve() for path in inputs]
+    resolved_source_root = Path(source_root).resolve() if source_root is not None else None
     if len(resolved) != len(set(resolved)):
         raise TelemetryValidationError("Input telemetry paths must be unique.")
     for path in resolved:
-        transformed = transform_records(load_jsonl(path))
+        records = load_jsonl(path)
+        if resolved_source_root is not None:
+            try:
+                source_artifact = path.relative_to(resolved_source_root).as_posix()
+            except ValueError as error:
+                raise TelemetryValidationError(
+                    "Telemetry input %s is outside source root %s"
+                    % (path, resolved_source_root)
+                ) from error
+            for record in records:
+                record["_source"] = source_artifact
+        transformed = transform_records(records)
         for filename in combined:
             combined[filename].extend(transformed[filename])
     written = write_tables(combined, output_dir)
@@ -1305,13 +1317,25 @@ def parse_args(argv=None):
         required=True,
         help="New or existing directory for the five derived CSV files.",
     )
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        help=(
+            "Optional root used to store repository-relative source_artifact "
+            "paths in derived CSVs. Inputs outside this root are rejected."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
     try:
-        written, counts = parse_files(args.inputs, args.output_dir)
+        written, counts = parse_files(
+            args.inputs,
+            args.output_dir,
+            source_root=args.source_root,
+        )
     except TelemetryValidationError as error:
         raise SystemExit("Telemetry validation failed: %s" % error) from error
     for path in written:

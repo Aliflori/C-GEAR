@@ -1,6 +1,6 @@
 {
   "schema_version": "cgear_report_figures.v1",
-  "source_data": "/home/ali/LoRa_Project/IncreLoRA/final_report/data",
+  "source_data": "final_report/data",
   "paper_figures": [
     "cgear_allocation_event.pdf",
     "cgear_genetic_search.pdf",

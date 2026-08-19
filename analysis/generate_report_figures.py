@@ -524,6 +524,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     configure_style()
+    repository = Path(__file__).resolve().parents[1]
     data_dir, output_dir = args.data_dir.resolve(), args.output_dir.resolve()
     results = pd.read_csv(data_dir / "canonical_results_seeds_41_46.csv")
     rank_df = pd.read_csv(data_dir / "telemetry" / "rank_trajectory.csv")
@@ -542,9 +543,13 @@ def main() -> None:
         mechanistic_rank_allocation(module_df, output_dir, seed=41),
         calibration_history(calibration_df, output_dir, seed=41),
     ]
+    try:
+        source_data = data_dir.relative_to(repository).as_posix()
+    except ValueError:
+        source_data = str(data_dir)
     manifest = {
         "schema_version": "cgear_report_figures.v1",
-        "source_data": str(data_dir),
+        "source_data": source_data,
         "paper_figures": [
             "cgear_allocation_event.pdf",
             "cgear_genetic_search.pdf",

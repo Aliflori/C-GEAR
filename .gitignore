@@ -1,5 +1,6 @@
 
 # Local training outputs
+/.venv/
 /NLU/output/
 *.log
 **/checkpoint-*/
