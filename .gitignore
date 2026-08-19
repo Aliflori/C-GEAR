@@ -1,5 +1,6 @@
 
 # Local training outputs
+/.venv/
 /NLU/output/
 *.log
 **/checkpoint-*/
@@ -8,3 +9,21 @@
 *.bak
 /NLU/runs/
 /NLU/wandb/
+
+# Large model, optimizer, and TensorBoard artifacts
+**/pytorch_model.bin
+**/*.safetensors
+**/optimizer.pt
+**/scheduler.pt
+**/scaler.pt
+**/rng_state*.pth
+**/training_args.bin
+**/events.out.tfevents.*
+
+# Report build intermediates
+/final_report/rendered/
+/final_report/paper/*.aux
+/final_report/paper/*.bbl
+/final_report/paper/*.blg
+/final_report/paper/*.out
+/final_report/paper/*.toc

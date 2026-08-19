@@ -1,0 +1,63 @@
+{
+  "comparison_rule": {
+    "architecture_only": "final-trajectory active parameters and ranks are reported separately",
+    "primary": "selected-checkpoint accuracy paired with selected-checkpoint active parameters"
+  },
+  "dataset": "GLUE RTE validation set",
+  "methods": {
+    "C-GEAR": {
+      "mean_accuracy_percent": 88.08664259927798,
+      "mean_final_active_parameters": 804059.6666666666,
+      "mean_final_active_rank": 89.66666666666667,
+      "mean_runtime_seconds": 1707.2593833333333,
+      "mean_selected_active_parameters": 795224.6666666666,
+      "mean_selected_active_rank": 86.66666666666667,
+      "sample_sd_accuracy_percent": 1.1416164838152976,
+      "sample_sd_final_active_parameters": 39335.9903226888,
+      "sample_sd_final_active_rank": 14.975535605335345,
+      "sample_sd_runtime_seconds": 160.323309337344,
+      "sample_sd_selected_active_parameters": 37122.987528843456,
+      "sample_sd_selected_active_rank": 14.472963299430655,
+      "seed_count": 6
+    },
+    "Greedy IncreLoRA": {
+      "mean_accuracy_percent": 87.30445246690734,
+      "mean_final_active_parameters": 933650.0,
+      "mean_final_active_rank": 144.0,
+      "mean_runtime_seconds": 1506.0937666666666,
+      "mean_selected_active_parameters": 828005.0,
+      "mean_selected_active_rank": 99.0,
+      "sample_sd_accuracy_percent": 0.8363201133041678,
+      "sample_sd_final_active_parameters": 5337.461868716254,
+      "sample_sd_final_active_rank": 0.0,
+      "sample_sd_runtime_seconds": 6.532441957083613,
+      "sample_sd_selected_active_parameters": 65234.498290398464,
+      "sample_sd_selected_active_rank": 27.784887978899608,
+      "seed_count": 6
+    }
+  },
+  "official_seeds": [
+    41,
+    42,
+    43,
+    44,
+    45,
+    46
+  ],
+  "paired": {
+    "final_reduction_from_aggregate_means_percent": 13.879969296131675,
+    "mean_accuracy_difference_percentage_points": 0.7821901323706394,
+    "mean_final_parameter_reduction": 129590.33333333333,
+    "mean_paired_final_parameter_reduction_percent": 13.863281721261995,
+    "mean_paired_selected_parameter_reduction_percent": 3.553715184362782,
+    "mean_selected_parameter_reduction": 32780.333333333336,
+    "sample_sd_accuracy_difference_percentage_points": 1.759966366944469,
+    "selected_reduction_from_aggregate_means_percent": 3.958953548992261,
+    "wins_ties_losses": {
+      "losses": 2,
+      "ties": 0,
+      "wins": 4
+    }
+  },
+  "schema_version": "cgear_rte_final.v1"
+}

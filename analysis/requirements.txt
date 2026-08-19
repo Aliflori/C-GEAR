@@ -1,0 +1,4 @@
+# Lightweight analysis dependencies, separate from NLU training requirements.
+matplotlib==3.5.3
+numpy==1.20.2
+pandas==1.3.0

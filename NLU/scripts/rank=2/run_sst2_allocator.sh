@@ -63,6 +63,7 @@ examples/text-classification/run_glue.py \
 --report_to tensorboard \
 --seed "${seed}" \
 --rank_allocator "${allocator}" \
+--rank_telemetry true \
 --ga_population 12 \
 --ga_generations 4 \
 --ga_mutation_rate 0.10 \
